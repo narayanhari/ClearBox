@@ -2,8 +2,17 @@
   "name": "clearbox-personal-prototype",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@10.11.1",
   "engines": {
     "node": ">=22.13.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "esbuild": "0.28.1",
+      "postcss": "8.5.25",
+      "sharp": "0.35.0",
+      "undici": "7.29.0"
+    }
   },
   "scripts": {
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
