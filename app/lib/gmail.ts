@@ -4,8 +4,10 @@ import { getDatabase, getEnvironment } from "@/db/runtime";
 import { PublicHttpError } from "./http";
 
 const GMAIL_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me";
-const SYNC_PAGE_SIZE = 35;
-const GMAIL_MUTATION_CONCURRENCY = 5;
+// Leave room beneath the Workers Free limit of 50 external subrequests:
+// one OAuth refresh, one Gmail list request, and up to 45 message reads.
+const SYNC_PAGE_SIZE = 45;
+const GMAIL_MUTATION_CONCURRENCY = 6;
 
 interface GmailListResponse {
   messages?: Array<{ id: string; threadId: string }>;
@@ -198,7 +200,7 @@ export async function syncMailboxPage(account: GmailAccount): Promise<SyncPageRe
     const page = await gmailFetch<GmailListResponse>(accessToken, `/messages?${params.toString()}`);
     const ids = page.messages ?? [];
 
-    const rawMessages = await mapWithConcurrency(ids, 5, ({ id }) => {
+    const rawMessages = await mapWithConcurrency(ids, GMAIL_MUTATION_CONCURRENCY, ({ id }) => {
       const params = new URLSearchParams({ format: "metadata" });
       for (const field of ["From", "Subject", "Date"]) params.append("metadataHeaders", field);
       return gmailFetch<GmailMessageResponse>(accessToken, `/messages/${encodeURIComponent(id)}?${params.toString()}`);

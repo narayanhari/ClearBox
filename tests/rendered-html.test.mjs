@@ -58,8 +58,8 @@ test("keeps Gmail work inside Cloudflare free-tier request ceilings", async () =
     readFile(new URL("../app/api/cleanup/trash/route.ts", import.meta.url), "utf8"),
   ]);
 
-  assert.match(gmail, /SYNC_PAGE_SIZE = 35/);
-  assert.match(gmail, /GMAIL_MUTATION_CONCURRENCY = 5/);
+  assert.match(gmail, /SYNC_PAGE_SIZE = 45/);
+  assert.match(gmail, /GMAIL_MUTATION_CONCURRENCY = 6/);
   assert.match(cleanup, /CLEANUP_REQUEST_BATCH_SIZE = 20/);
 });
 
