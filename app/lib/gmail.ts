@@ -2,12 +2,24 @@ import type { CurrentUser, GmailAccount } from "./auth";
 import { decryptSecret } from "./crypto";
 import { getDatabase, getEnvironment } from "@/db/runtime";
 import { PublicHttpError } from "./http";
+import {
+  createGmailMetadataBatch,
+  GMAIL_BATCH_RESPONSE_LIMIT_BYTES,
+  GMAIL_METADATA_BATCH_SIZE,
+  parseGmailBatchResponse,
+} from "./gmail-batch";
 
 const GMAIL_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me";
-// Leave room beneath the Workers Free limit of 50 external subrequests:
-// one OAuth refresh, one Gmail list request, and up to 45 message reads.
-const SYNC_PAGE_SIZE = 45;
+const GMAIL_BATCH_ROOT = "https://gmail.googleapis.com/batch";
+// One OAuth refresh, one list request, and five metadata batch requests keeps
+// a 250-message page well below the Workers Free external-subrequest ceiling.
+const SYNC_PAGE_SIZE = 250;
+const GMAIL_READ_BATCH_CONCURRENCY = 3;
+const GMAIL_BATCH_MAX_ATTEMPTS = 3;
 const GMAIL_MUTATION_CONCURRENCY = 6;
+const MAX_FROM_HEADER_LENGTH = 1_000;
+const MAX_SUBJECT_LENGTH = 2_000;
+const MAX_DATE_HEADER_LENGTH = 256;
 
 interface GmailListResponse {
   messages?: Array<{ id: string; threadId: string }>;
@@ -120,6 +132,10 @@ function header(message: GmailMessageResponse, name: string): string {
   return message.payload?.headers?.find((item) => item.name.toLowerCase() === name.toLowerCase())?.value ?? "";
 }
 
+function boundedHeader(message: GmailMessageResponse, name: string, limit: number): string {
+  return header(message, name).slice(0, limit);
+}
+
 export function parseSender(value: string): { name: string; email: string } {
   const angleAddress = value.match(/<\s*([^<>\s]+@[^<>\s]+)\s*>/);
   const bareAddress = value.match(/([A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i);
@@ -133,16 +149,22 @@ export function parseSender(value: string): { name: string; email: string } {
 }
 
 function indexMessage(message: GmailMessageResponse): IndexedMessage | null {
-  const sender = parseSender(header(message, "From"));
+  const sender = parseSender(boundedHeader(message, "From", MAX_FROM_HEADER_LENGTH));
   if (!sender.email.includes("@")) return null;
   const labels = message.labelIds ?? [];
-  const receivedAt = Number(message.internalDate) || Date.parse(header(message, "Date")) || Date.now();
+  const internalDate = Number(message.internalDate);
+  const parsedDate = Date.parse(boundedHeader(message, "Date", MAX_DATE_HEADER_LENGTH));
+  const receivedAt = Number.isFinite(internalDate) && internalDate > 0
+    ? internalDate
+    : Number.isFinite(parsedDate)
+      ? parsedDate
+      : Date.now();
   return {
     id: message.id,
     threadId: message.threadId,
     senderEmail: sender.email,
     senderName: sender.name,
-    subject: header(message, "Subject") || "(No subject)",
+    subject: boundedHeader(message, "Subject", MAX_SUBJECT_LENGTH) || "(No subject)",
     receivedAt,
     isUnread: labels.includes("UNREAD"),
     isStarred: labels.includes("STARRED"),
@@ -150,6 +172,167 @@ function indexMessage(message: GmailMessageResponse): IndexedMessage | null {
     labels,
     historyId: message.historyId,
   };
+}
+
+function isGmailMessageResponse(value: unknown, expectedId: string): value is GmailMessageResponse {
+  if (!value || typeof value !== "object") return false;
+  const message = value as GmailMessageResponse;
+  if (message.id !== expectedId || typeof message.threadId !== "string") return false;
+  if (message.labelIds !== undefined) {
+    if (!Array.isArray(message.labelIds) || !message.labelIds.every((label) => typeof label === "string")) {
+      return false;
+    }
+  }
+  if (message.historyId !== undefined && typeof message.historyId !== "string") return false;
+  if (message.internalDate !== undefined && typeof message.internalDate !== "string") return false;
+  if (message.payload !== undefined) {
+    if (!message.payload || typeof message.payload !== "object") return false;
+    if (message.payload.headers !== undefined) {
+      if (
+        !Array.isArray(message.payload.headers) ||
+        !message.payload.headers.every(
+          (item) => item && typeof item.name === "string" && typeof item.value === "string",
+        )
+      ) return false;
+    }
+  }
+  return true;
+}
+
+async function boundedResponseText(response: Response): Promise<string> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > GMAIL_BATCH_RESPONSE_LIMIT_BYTES) {
+    throw new PublicHttpError(502, "Gmail returned an unexpectedly large response.");
+  }
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > GMAIL_BATCH_RESPONSE_LIMIT_BYTES) {
+        await reader.cancel();
+        throw new PublicHttpError(502, "Gmail returned an unexpectedly large response.");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(combined);
+}
+
+async function fetchGmailMetadataBatch(
+  accessToken: string,
+  messageIds: string[],
+): Promise<GmailMessageResponse[]> {
+  let pending = [...messageIds];
+  const completed = new Map<string, GmailMessageResponse>();
+
+  for (let attempt = 0; attempt < GMAIL_BATCH_MAX_ATTEMPTS && pending.length; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1_000 * 2 ** (attempt - 1) + Math.random() * 250));
+    }
+
+    const batch = createGmailMetadataBatch(pending);
+    let response: Response;
+    try {
+      response = await fetch(GMAIL_BATCH_ROOT, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": batch.contentType,
+          accept: "multipart/mixed",
+        },
+        body: batch.body,
+      });
+    } catch {
+      if (attempt + 1 < GMAIL_BATCH_MAX_ATTEMPTS) continue;
+      throw new PublicHttpError(503, "Gmail is temporarily unavailable. Retrying shortly may help.");
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      throw new PublicHttpError(401, "Gmail authorization has expired. Please reconnect.");
+    }
+    if (response.status === 429 || response.status >= 500) {
+      if (attempt + 1 < GMAIL_BATCH_MAX_ATTEMPTS) continue;
+      throw new PublicHttpError(503, "Gmail is temporarily rate-limiting requests. Retrying shortly may help.");
+    }
+    if (!response.ok) {
+      throw new PublicHttpError(502, "Gmail could not complete the request. Please try again.");
+    }
+
+    let parts;
+    try {
+      parts = parseGmailBatchResponse(
+        response.headers.get("content-type") ?? "",
+        await boundedResponseText(response),
+        batch.parts.map((part) => part.contentId),
+      );
+    } catch (error) {
+      if (error instanceof PublicHttpError) throw error;
+      throw new PublicHttpError(502, "Gmail returned an invalid batch response.");
+    }
+
+    const retry: string[] = [];
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index];
+      const messageId = batch.parts[index].messageId;
+      if (part.status === 401 || part.status === 403) {
+        throw new PublicHttpError(401, "Gmail authorization has expired. Please reconnect.");
+      }
+      if (part.status === 429 || part.status >= 500) {
+        retry.push(messageId);
+        continue;
+      }
+      if (part.status < 200 || part.status >= 300) {
+        throw new PublicHttpError(502, "Gmail could not read a message during synchronization.");
+      }
+
+      let payload: unknown;
+      try {
+        payload = JSON.parse(part.body);
+      } catch {
+        throw new PublicHttpError(502, "Gmail returned invalid message metadata.");
+      }
+      if (!isGmailMessageResponse(payload, messageId)) {
+        throw new PublicHttpError(502, "Gmail returned unexpected message metadata.");
+      }
+      completed.set(messageId, payload);
+    }
+    pending = retry;
+  }
+
+  if (pending.length) {
+    throw new PublicHttpError(503, "Gmail is temporarily rate-limiting requests. Retrying shortly may help.");
+  }
+  return messageIds.map((messageId) => {
+    const message = completed.get(messageId);
+    if (!message) throw new PublicHttpError(502, "Gmail batch response was incomplete.");
+    return message;
+  });
+}
+
+async function fetchGmailMetadata(accessToken: string, messageIds: string[]): Promise<GmailMessageResponse[]> {
+  const batches: string[][] = [];
+  for (let offset = 0; offset < messageIds.length; offset += GMAIL_METADATA_BATCH_SIZE) {
+    batches.push(messageIds.slice(offset, offset + GMAIL_METADATA_BATCH_SIZE));
+  }
+  const results = await mapWithConcurrency(batches, GMAIL_READ_BATCH_CONCURRENCY, (batch) =>
+    fetchGmailMetadataBatch(accessToken, batch),
+  );
+  return results.flat();
 }
 
 async function mapWithConcurrency<T, R>(
@@ -200,11 +383,7 @@ export async function syncMailboxPage(account: GmailAccount): Promise<SyncPageRe
     const page = await gmailFetch<GmailListResponse>(accessToken, `/messages?${params.toString()}`);
     const ids = page.messages ?? [];
 
-    const rawMessages = await mapWithConcurrency(ids, GMAIL_MUTATION_CONCURRENCY, ({ id }) => {
-      const params = new URLSearchParams({ format: "metadata" });
-      for (const field of ["From", "Subject", "Date"]) params.append("metadataHeaders", field);
-      return gmailFetch<GmailMessageResponse>(accessToken, `/messages/${encodeURIComponent(id)}?${params.toString()}`);
-    });
+    const rawMessages = await fetchGmailMetadata(accessToken, ids.map(({ id }) => id));
     const indexed = rawMessages.map(indexMessage).filter((message): message is IndexedMessage => Boolean(message));
 
     for (let offset = 0; offset < indexed.length; offset += 50) {

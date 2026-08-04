@@ -53,13 +53,17 @@ test("continues bulk cleanup until every eligible sender message is moved", asyn
 });
 
 test("keeps Gmail work inside Cloudflare free-tier request ceilings", async () => {
-  const [gmail, cleanup] = await Promise.all([
+  const [gmail, gmailBatch, cleanup] = await Promise.all([
     readFile(new URL("../app/lib/gmail.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/gmail-batch.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/cleanup/trash/route.ts", import.meta.url), "utf8"),
   ]);
 
-  assert.match(gmail, /SYNC_PAGE_SIZE = 45/);
+  assert.match(gmail, /SYNC_PAGE_SIZE = 250/);
+  assert.match(gmail, /GMAIL_READ_BATCH_CONCURRENCY = 3/);
   assert.match(gmail, /GMAIL_MUTATION_CONCURRENCY = 6/);
+  assert.match(gmailBatch, /GMAIL_METADATA_BATCH_SIZE = 50/);
+  assert.match(gmailBatch, /payload\/headers/);
   assert.match(cleanup, /CLEANUP_REQUEST_BATCH_SIZE = 20/);
 });
 
@@ -100,6 +104,8 @@ test("scans the entire Inbox and scopes multiple accounts to one owner", async (
   ]);
 
   assert.match(gmail, /labelIds.*INBOX/);
+  assert.match(gmail, /createGmailMetadataBatch/);
+  assert.match(gmail, /parseGmailBatchResponse/);
   assert.match(gmail, /sync_page_token/);
   assert.doesNotMatch(gmail, /newer_than|cappedAt/);
   assert.match(sync, /getConnectedAccount/);
@@ -109,6 +115,16 @@ test("scans the entire Inbox and scopes multiple accounts to one owner", async (
   assert.match(senders, /a\.email AS accountEmail/);
   assert.match(trash, /a\.owner_user_id = \?/);
   assert.match(schema, /ownerUserId: text\("owner_user_id"\)/);
+});
+
+test("shows progressive results and retries temporary Gmail throttling", async () => {
+  const dashboard = await readFile(new URL("../app/MailDashboard.tsx", import.meta.url), "utf8");
+
+  assert.match(dashboard, /response\.status === 503/);
+  assert.match(dashboard, /SYNC_STATUS_RETRY_LIMIT = 4/);
+  assert.match(dashboard, /PROGRESSIVE_DASHBOARD_PAGE_INTERVAL = 8/);
+  assert.match(dashboard, /pageCount === 1/);
+  assert.match(dashboard, /await loadDashboard\(\)/);
 });
 
 test("loads only ten on-demand sender previews without persisting them", async () => {

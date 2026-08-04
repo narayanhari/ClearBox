@@ -57,6 +57,8 @@ interface ToastState {
 
 const compactNumber = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 const actionHeaders = { "x-clearbox-action": "1" };
+const SYNC_STATUS_RETRY_LIMIT = 4;
+const PROGRESSIVE_DASHBOARD_PAGE_INTERVAL = 8;
 
 function relativeTime(timestamp: number | null): string {
   if (!timestamp) return "Not synced yet";
@@ -229,6 +231,8 @@ export function MailDashboard() {
       for (const account of accounts) {
         let complete = false;
         let accountIndexed = account.syncIndexedCount;
+        let pageCount = 0;
+        let transientRetries = 0;
         while (!complete) {
           setToast({
             message: `Scanning ${account.email}…${accountIndexed ? ` ${accountIndexed.toLocaleString()} indexed` : ""}`,
@@ -243,9 +247,21 @@ export function MailDashboard() {
             indexedTotal?: number;
             complete?: boolean;
           };
+          if (response.status === 503 && transientRetries < SYNC_STATUS_RETRY_LIMIT) {
+            const waitMs = Math.min(30_000, 2_000 * 2 ** transientRetries);
+            transientRetries += 1;
+            setToast({ message: `Gmail is busy. Retrying ${account.email} in ${Math.round(waitMs / 1000)}s…` });
+            await new Promise((resolve) => window.setTimeout(resolve, waitMs));
+            continue;
+          }
           if (!response.ok) throw new Error(payload.error ?? `Sync failed for ${account.email}`);
+          transientRetries = 0;
           accountIndexed = payload.indexedTotal ?? accountIndexed;
           complete = Boolean(payload.complete);
+          pageCount += 1;
+          if (pageCount === 1 || pageCount % PROGRESSIVE_DASHBOARD_PAGE_INTERVAL === 0 || complete) {
+            await loadDashboard();
+          }
         }
         completedIndexed += accountIndexed;
       }
