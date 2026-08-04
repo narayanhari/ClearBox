@@ -4,6 +4,7 @@
   "main": "dist/server/index.js",
   "compatibility_date": "2026-07-31",
   "compatibility_flags": ["nodejs_compat"],
+  "minify": true,
   "workers_dev": false,
   "routes": [
     {
