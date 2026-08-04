@@ -4,6 +4,13 @@
   "main": "dist/server/index.js",
   "compatibility_date": "2026-07-31",
   "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "clearbox.narayanhari.in",
+      "custom_domain": true
+    }
+  ],
   "assets": {
     "binding": "ASSETS",
     "directory": "dist/client"
