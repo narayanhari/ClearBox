@@ -59,10 +59,13 @@ test("keeps Gmail work inside Cloudflare free-tier request ceilings", async () =
     readFile(new URL("../app/api/cleanup/trash/route.ts", import.meta.url), "utf8"),
   ]);
 
-  assert.match(gmail, /SYNC_PAGE_SIZE = 250/);
-  assert.match(gmail, /GMAIL_READ_BATCH_CONCURRENCY = 3/);
+  assert.match(gmail, /SYNC_PAGE_SIZE = GMAIL_METADATA_BATCH_SIZE/);
+  assert.match(gmail, /GMAIL_READ_BATCH_CONCURRENCY = 1/);
+  assert.match(gmail, /SYNC_LOCK_LEASE_MS = 60_000/);
+  assert.match(gmail, /MAX_ACCESS_TOKEN_CACHE_ENTRIES = 150/);
+  assert.match(gmail, /accessTokenCache/);
   assert.match(gmail, /GMAIL_MUTATION_CONCURRENCY = 6/);
-  assert.match(gmailBatch, /GMAIL_METADATA_BATCH_SIZE = 50/);
+  assert.match(gmailBatch, /GMAIL_METADATA_BATCH_SIZE = 20/);
   assert.match(gmailBatch, /payload\/headers/);
   assert.match(cleanup, /CLEANUP_REQUEST_BATCH_SIZE = 20/);
 });
@@ -173,8 +176,10 @@ test("shows progressive results and retries temporary Gmail throttling", async (
   const dashboard = await readFile(new URL("../app/MailDashboard.tsx", import.meta.url), "utf8");
 
   assert.match(dashboard, /response\.status === 503/);
-  assert.match(dashboard, /SYNC_STATUS_RETRY_LIMIT = 4/);
-  assert.match(dashboard, /PROGRESSIVE_DASHBOARD_PAGE_INTERVAL = 8/);
+  assert.match(dashboard, /SYNC_STATUS_RETRY_LIMIT = 6/);
+  assert.match(dashboard, /SYNC_LOCK_RETRY_LIMIT = 15/);
+  assert.match(dashboard, /PROGRESSIVE_DASHBOARD_PAGE_INTERVAL = 25/);
+  assert.match(dashboard, /readApiJson/);
   assert.match(dashboard, /pageCount === 1/);
   assert.match(dashboard, /await loadDashboard\(\)/);
 });

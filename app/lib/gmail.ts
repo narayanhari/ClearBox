@@ -7,20 +7,38 @@ import {
   createGmailMetadataBatch,
   GMAIL_BATCH_RESPONSE_LIMIT_BYTES,
   GMAIL_METADATA_BATCH_SIZE,
+  isUnavailableGmailMessageStatus,
   parseGmailBatchResponse,
 } from "./gmail-batch";
 
 const GMAIL_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me";
 const GMAIL_BATCH_ROOT = "https://gmail.googleapis.com/batch";
-// One OAuth refresh, one list request, and five metadata batch requests keeps
-// a 250-message page well below the Workers Free external-subrequest ceiling.
-const SYNC_PAGE_SIZE = 250;
-const GMAIL_READ_BATCH_CONCURRENCY = 3;
-const GMAIL_BATCH_MAX_ATTEMPTS = 3;
+// The Workers Free plan allows only 10 ms of CPU per invocation. Keep one
+// small metadata batch per page; the browser immediately requests the next
+// resumable page, so throughput stays high without one invocation doing a
+// large parse and D1 write burst.
+const SYNC_PAGE_SIZE = GMAIL_METADATA_BATCH_SIZE;
+const GMAIL_READ_BATCH_CONCURRENCY = 1;
+const GMAIL_BATCH_MAX_ATTEMPTS = 1;
+const GMAIL_REQUEST_TIMEOUT_MS = 15_000;
+const SYNC_LOCK_LEASE_MS = 60_000;
+const ACCESS_TOKEN_EXPIRY_SKEW_MS = 60_000;
+const MAX_ACCESS_TOKEN_CACHE_ENTRIES = 150;
 const GMAIL_MUTATION_CONCURRENCY = 6;
 const MAX_FROM_HEADER_LENGTH = 1_000;
 const MAX_SUBJECT_LENGTH = 2_000;
 const MAX_DATE_HEADER_LENGTH = 256;
+
+interface CachedAccessToken {
+  token: string;
+  expiresAt: number;
+}
+
+// Worker isolates are reused across consecutive sync pages. Caching the
+// short-lived access token avoids decrypting and refreshing the long-lived
+// refresh token for every 20-message page. The cache is memory-only and
+// bounded to the beta's maximum linked-account count plus headroom.
+const accessTokenCache = new Map<string, CachedAccessToken>();
 
 interface GmailListResponse {
   messages?: Array<{ id: string; threadId: string }>;
@@ -81,33 +99,61 @@ export function getGoogleOAuthConfig(): { clientId: string; clientSecret: string
 }
 
 export async function refreshAccessToken(refreshTokenEncrypted: string): Promise<string> {
+  const cached = accessTokenCache.get(refreshTokenEncrypted);
+  if (cached && cached.expiresAt > Date.now() + ACCESS_TOKEN_EXPIRY_SKEW_MS) {
+    return cached.token;
+  }
+  if (cached) accessTokenCache.delete(refreshTokenEncrypted);
+
   const { clientId, clientSecret } = googleConfig();
   const refreshToken = await decryptSecret(refreshTokenEncrypted);
-  const response = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-      grant_type: "refresh_token",
-    }),
-  });
-  const payload = (await response.json()) as { access_token?: string };
+  let response: Response;
+  try {
+    response = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+      }),
+      signal: AbortSignal.timeout(GMAIL_REQUEST_TIMEOUT_MS),
+    });
+  } catch {
+    throw new PublicHttpError(503, "Google authorization is temporarily unavailable. Please retry shortly.");
+  }
+  const payload = (await response.json()) as { access_token?: string; expires_in?: number };
   if (!response.ok || !payload.access_token) {
     throw new PublicHttpError(401, "Gmail authorization has expired. Please reconnect.");
+  }
+  const expiresInSeconds = Number.isFinite(payload.expires_in) ? Math.max(60, payload.expires_in!) : 3_600;
+  accessTokenCache.set(refreshTokenEncrypted, {
+    token: payload.access_token,
+    expiresAt: Date.now() + expiresInSeconds * 1_000,
+  });
+  while (accessTokenCache.size > MAX_ACCESS_TOKEN_CACHE_ENTRIES) {
+    const oldestKey = accessTokenCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    accessTokenCache.delete(oldestKey);
   }
   return payload.access_token;
 }
 
 async function gmailFetch<T>(accessToken: string, path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${GMAIL_ROOT}${path}`, {
-    ...init,
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      ...(init?.headers ?? {}),
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${GMAIL_ROOT}${path}`, {
+      ...init,
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        ...(init?.headers ?? {}),
+      },
+      signal: init?.signal ?? AbortSignal.timeout(GMAIL_REQUEST_TIMEOUT_MS),
+    });
+  } catch {
+    throw new PublicHttpError(503, "Gmail is temporarily unavailable. Please retry again shortly.");
+  }
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
       throw new PublicHttpError(401, "Gmail authorization has expired. Please reconnect.");
@@ -249,6 +295,7 @@ async function fetchGmailMetadataBatch(
           accept: "multipart/mixed",
         },
         body: batch.body,
+        signal: AbortSignal.timeout(GMAIL_REQUEST_TIMEOUT_MS),
       });
     } catch {
       if (attempt + 1 < GMAIL_BATCH_MAX_ATTEMPTS) continue;
@@ -289,7 +336,20 @@ async function fetchGmailMetadataBatch(
         retry.push(messageId);
         continue;
       }
+      if (isUnavailableGmailMessageStatus(part.status)) {
+        // Gmail can list a message that is moved or deleted before its metadata
+        // batch is read. That race should not abort the entire Inbox scan.
+        console.warn("Gmail metadata message became unavailable", {
+          status: part.status,
+          batchSize: batch.parts.length,
+        });
+        continue;
+      }
       if (part.status < 200 || part.status >= 300) {
+        console.warn("Gmail metadata batch part failed", {
+          status: part.status,
+          batchSize: batch.parts.length,
+        });
         throw new PublicHttpError(502, "Gmail could not read a message during synchronization.");
       }
 
@@ -310,10 +370,9 @@ async function fetchGmailMetadataBatch(
   if (pending.length) {
     throw new PublicHttpError(503, "Gmail is temporarily rate-limiting requests. Retrying shortly may help.");
   }
-  return messageIds.map((messageId) => {
+  return messageIds.flatMap((messageId) => {
     const message = completed.get(messageId);
-    if (!message) throw new PublicHttpError(502, "Gmail batch response was incomplete.");
-    return message;
+    return message ? [message] : [];
   });
 }
 
@@ -359,7 +418,7 @@ export async function syncMailboxPage(account: GmailAccount): Promise<SyncPageRe
       `UPDATE users SET sync_status = 'syncing', updated_at = ?
        WHERE id = ? AND (sync_status != 'syncing' OR updated_at < ?)`,
     )
-    .bind(now, account.id, now - 10 * 60 * 1000)
+    .bind(now, account.id, now - SYNC_LOCK_LEASE_MS)
     .run();
   if (lock.meta.changes === 0) {
     throw new PublicHttpError(409, "A mailbox scan is already in progress.");

@@ -1,7 +1,14 @@
 const GMAIL_MESSAGE_PATH = "/gmail/v1/users/me/messages";
 
-export const GMAIL_METADATA_BATCH_SIZE = 50;
+// Keep each Worker invocation comfortably below the free plan's 10 ms CPU
+// allowance. One small Gmail batch per sync page avoids parsing several large
+// multipart responses in the same invocation.
+export const GMAIL_METADATA_BATCH_SIZE = 20;
 export const GMAIL_BATCH_RESPONSE_LIMIT_BYTES = 4 * 1024 * 1024;
+
+export function isUnavailableGmailMessageStatus(status: number): boolean {
+  return status === 404 || status === 410;
+}
 
 export interface GmailBatchRequestPart {
   contentId: string;

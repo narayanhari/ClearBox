@@ -1,6 +1,7 @@
 "use client";
 
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ApiResponseError, readApiJson } from "@/app/lib/client-http";
 
 interface SenderSummary {
   email: string;
@@ -65,8 +66,9 @@ interface BetaMember {
 
 const compactNumber = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 const actionHeaders = { "x-clearbox-action": "1" };
-const SYNC_STATUS_RETRY_LIMIT = 4;
-const PROGRESSIVE_DASHBOARD_PAGE_INTERVAL = 8;
+const SYNC_STATUS_RETRY_LIMIT = 6;
+const SYNC_LOCK_RETRY_LIMIT = 15;
+const PROGRESSIVE_DASHBOARD_PAGE_INTERVAL = 25;
 
 function relativeTime(timestamp: number | null): string {
   if (!timestamp) return "Not synced yet";
@@ -280,6 +282,7 @@ export function MailDashboard() {
         let accountIndexed = account.syncIndexedCount;
         let pageCount = 0;
         let transientRetries = 0;
+        let lockRetries = 0;
         while (!complete) {
           setToast({
             message: `Scanning ${account.email}…${accountIndexed ? ` ${accountIndexed.toLocaleString()} indexed` : ""}`,
@@ -289,11 +292,31 @@ export function MailDashboard() {
             headers: { ...actionHeaders, "content-type": "application/json" },
             body: JSON.stringify({ accountEmail: account.email }),
           });
-          const payload = (await response.json()) as {
-            error?: string;
-            indexedTotal?: number;
-            complete?: boolean;
-          };
+          let payload: { error?: string; indexedTotal?: number; complete?: boolean };
+          try {
+            payload = await readApiJson(response);
+          } catch (error) {
+            if (
+              error instanceof ApiResponseError &&
+              error.retryable &&
+              transientRetries < SYNC_STATUS_RETRY_LIMIT
+            ) {
+              const waitMs = Math.min(20_000, 3_000 * 2 ** transientRetries);
+              transientRetries += 1;
+              setToast({
+                message: `Cloudflare interrupted the scan. Retrying ${account.email} in ${Math.round(waitMs / 1000)}s…`,
+              });
+              await new Promise((resolve) => window.setTimeout(resolve, waitMs));
+              continue;
+            }
+            throw error;
+          }
+          if (response.status === 409 && lockRetries < SYNC_LOCK_RETRY_LIMIT) {
+            lockRetries += 1;
+            setToast({ message: `Waiting for the previous ${account.email} scan step to finish…` });
+            await new Promise((resolve) => window.setTimeout(resolve, 5_000));
+            continue;
+          }
           if (response.status === 503 && transientRetries < SYNC_STATUS_RETRY_LIMIT) {
             const waitMs = Math.min(30_000, 2_000 * 2 ** transientRetries);
             transientRetries += 1;
@@ -303,6 +326,7 @@ export function MailDashboard() {
           }
           if (!response.ok) throw new Error(payload.error ?? `Sync failed for ${account.email}`);
           transientRetries = 0;
+          lockRetries = 0;
           accountIndexed = payload.indexedTotal ?? accountIndexed;
           complete = Boolean(payload.complete);
           pageCount += 1;

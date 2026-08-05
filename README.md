@@ -7,6 +7,7 @@ Clearbox groups Gmail messages by exact sender address, ranks senders by message
 - Responsive sender dashboard with useful demo data before Gmail is connected.
 - Google OAuth with PKCE, state validation, an encrypted refresh token, and an HTTP-only session cookie.
 - A resumable metadata-only scan of every message currently in Gmail Inbox.
+- Free-tier-safe sync pages that process one 20-message Gmail metadata batch per Worker invocation, automatically retry transient failures, and recover abandoned scan locks after one minute.
 - Multiple Gmail accounts linked under one locally authenticated owner.
 - Email-verified invitations, administrator/member roles, immediate session revocation, and isolated workspaces for up to 25 beta members.
 - Exact sender grouping across all linked accounts, unread counts, protected-message counts, mailbox filtering, sender search, and sorting.
@@ -75,6 +76,8 @@ An app invitation does not send email and does not modify Google Cloud automatic
 7. Try bulk cleanup first on a sender with only a few non-important messages.
 
 The app never empties Gmail Trash. Gmail remains the source of truth, and messages moved to Trash stay recoverable through Gmail.
+
+On the Cloudflare Workers Free plan, Clearbox intentionally uses small sequential sync pages to stay within the 10 ms CPU allowance. A full scan therefore makes more short `/api/sync` requests than the local build. Short-lived Google access tokens are reused inside warm Worker isolates to avoid an OAuth refresh on every page. Messages moved or deleted between Gmail's list and metadata responses are skipped safely instead of aborting the scan. Cloudflare HTML error pages are never parsed as JSON, and a forcibly interrupted page is retried after its short lock expires.
 
 ## Security guardrails
 

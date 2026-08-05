@@ -70,6 +70,9 @@ export function requireReadRequest(request: Request): void {
 
 export function apiFailure(context: string, error: unknown, fallback: string): NextResponse {
   if (error instanceof PublicHttpError) {
+    const details = { status: error.status, errorType: error.name };
+    if (error.status >= 500) console.error(context, details);
+    else if (error.status === 409 || error.status === 429) console.warn(context, details);
     return NextResponse.json({ error: error.message }, { status: error.status });
   }
 

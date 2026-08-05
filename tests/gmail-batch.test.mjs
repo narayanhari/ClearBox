@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createGmailMetadataBatch,
   GMAIL_METADATA_BATCH_SIZE,
+  isUnavailableGmailMessageStatus,
   parseGmailBatchResponse,
 } from "../app/lib/gmail-batch.ts";
 
@@ -37,11 +38,19 @@ test("creates metadata-only Gmail batches without exposing authorization", () =>
 });
 
 test("rejects oversized request batches and header injection identifiers", () => {
+  assert.equal(GMAIL_METADATA_BATCH_SIZE, 20);
   assert.throws(
     () => createGmailMetadataBatch(Array.from({ length: GMAIL_METADATA_BATCH_SIZE + 1 }, (_, index) => `${index}`)),
     /must contain/,
   );
   assert.throws(() => createGmailMetadataBatch(["safe\r\nInjected: yes"]), /invalid message identifier/);
+});
+
+test("recognizes messages that can disappear safely during a Gmail scan", () => {
+  assert.equal(isUnavailableGmailMessageStatus(404), true);
+  assert.equal(isUnavailableGmailMessageStatus(410), true);
+  assert.equal(isUnavailableGmailMessageStatus(400), false);
+  assert.equal(isUnavailableGmailMessageStatus(429), false);
 });
 
 test("parses out-of-order multipart responses using strict content identifiers", () => {
