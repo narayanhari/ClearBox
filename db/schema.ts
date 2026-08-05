@@ -70,3 +70,17 @@ export const cleanupJobs = sqliteTable(
   },
   (table) => [index("cleanup_jobs_user_idx").on(table.userId, table.createdAt)],
 );
+
+export const betaMembers = sqliteTable(
+  "beta_members",
+  {
+    email: text("email").primaryKey(),
+    role: text("role").notNull().default("member"),
+    status: text("status").notNull().default("invited"),
+    invitedBy: text("invited_by"),
+    invitedAt: integer("invited_at").notNull(),
+    acceptedAt: integer("accepted_at"),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [index("beta_members_status_idx").on(table.status, table.invitedAt)],
+);

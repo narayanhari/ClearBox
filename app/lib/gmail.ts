@@ -2,6 +2,7 @@ import type { CurrentUser, GmailAccount } from "./auth";
 import { decryptSecret } from "./crypto";
 import { getDatabase, getEnvironment } from "@/db/runtime";
 import { PublicHttpError } from "./http";
+import { isBetaAccessConfigured } from "./beta";
 import {
   createGmailMetadataBatch,
   GMAIL_BATCH_RESPONSE_LIMIT_BYTES,
@@ -71,16 +72,8 @@ export function isGoogleConfigured(): boolean {
     environment.GOOGLE_CLIENT_ID &&
       environment.GOOGLE_CLIENT_SECRET &&
       environment.APP_ENCRYPTION_KEY &&
-      environment.ALLOWED_GMAIL_ADDRESS,
+      isBetaAccessConfigured(),
   );
-}
-
-export function getAllowedGmailAddress(): string {
-  const address = getEnvironment().ALLOWED_GMAIL_ADDRESS?.trim().toLowerCase();
-  if (!address || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) {
-    throw new Error("ALLOWED_GMAIL_ADDRESS is not configured correctly.");
-  }
-  return address;
 }
 
 export function getGoogleOAuthConfig(): { clientId: string; clientSecret: string } {
@@ -509,6 +502,7 @@ export async function revokeGoogleToken(token: string): Promise<void> {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ token }),
+    signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok && response.status !== 400) {
     throw new PublicHttpError(502, "Google access could not be revoked. Please try disconnecting again.");

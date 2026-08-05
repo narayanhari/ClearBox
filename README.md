@@ -1,13 +1,14 @@
-# Clearbox personal prototype
+# Clearbox invite-only beta
 
 Clearbox groups Gmail messages by exact sender address, ranks senders by message count, and lets you move individual or bulk messages to Gmail Trash. Inbox scans index headers and labels only. When you open a sender, the app fetches short Gmail previews for the 10 newest emails without saving those previews locally; full bodies and attachments are never downloaded.
 
-## Included in this prototype
+## Included in this beta
 
 - Responsive sender dashboard with useful demo data before Gmail is connected.
 - Google OAuth with PKCE, state validation, an encrypted refresh token, and an HTTP-only session cookie.
 - A resumable metadata-only scan of every message currently in Gmail Inbox.
 - Multiple Gmail accounts linked under one locally authenticated owner.
+- Email-verified invitations, administrator/member roles, immediate session revocation, and isolated workspaces for up to 25 beta members.
 - Exact sender grouping across all linked accounts, unread counts, protected-message counts, mailbox filtering, sender search, and sorting.
 - A conversation-style sender view with the latest 10 subjects and short, on-demand Gmail previews.
 - Single-message and exact-sender bulk cleanup.
@@ -15,29 +16,32 @@ Clearbox groups Gmail messages by exact sender address, ranks senders by message
 - Starred and important messages excluded from cleanup by default.
 - Gmail Trash only—no permanent-delete endpoint is used.
 - In-app undo for ten minutes after a cleanup.
-- Disconnect that revokes Google access and removes the locally indexed metadata.
+- Disconnect that always removes local tokens and indexed metadata, asks Google to revoke access, and warns when Google permissions need manual removal.
 
 ## One-time Google setup
 
 1. Create a project in [Google Cloud Console](https://console.cloud.google.com/).
 2. Enable the **Gmail API** for that project.
 3. Open **Google Auth Platform** and configure the audience as **External** with publishing status **Testing**.
-4. Add the owner Gmail and every additional Gmail you want to connect under **Test users**.
+4. Add the beta administrator under **Test users**. Add each invited address there before they connect Clearbox.
 5. Under **Data Access**, add the scope `https://www.googleapis.com/auth/gmail.modify`.
 6. Create an OAuth client with application type **Web application**.
 7. Add this authorized redirect URI exactly:
 
    ```text
    http://localhost:3000/api/auth/google/callback
+   https://clearbox.narayanhari.in/api/auth/google/callback
    ```
 
-8. Copy `.env.example` to `.env.local` and provide the client ID, client secret, your exact Gmail address in `ALLOWED_GMAIL_ADDRESS`, and the encryption key.
+   For the hosted beta, use `https://clearbox.narayanhari.in` as the application home page and `https://clearbox.narayanhari.in/privacy` as the privacy policy URL in Google Auth Platform.
+
+8. Copy `.env.example` to `.env.local` and provide the client ID, client secret, your exact Gmail address in `BETA_ADMIN_EMAIL`, and the encryption key.
 
    ```bash
    openssl rand -base64 32
    ```
 
-Google test-mode authorizations that include Gmail access expire after seven days. Reconnect when Google asks for consent again. This is expected for a personal test project in Testing status.
+Google projects in Testing are limited to 100 listed test users, and their authorizations expire after seven days. Clearbox deliberately uses a smaller 25-member beta cap. Members should reconnect when Google asks for consent again.
 
 ## Run locally
 
@@ -48,7 +52,17 @@ pnpm install
 pnpm run dev
 ```
 
-Open `http://localhost:3000` and choose **Connect Gmail**. Connect the exact owner address from `ALLOWED_GMAIL_ADDRESS` first, then use **+ Add Gmail** for additional accounts. Press **Scan entire Inbox** to build the combined sender view.
+Open `http://localhost:3000` and choose **Join with invited Gmail**. Connect the exact administrator address from `BETA_ADMIN_EMAIL` first. Open **Setup** to invite members, and add the same addresses to Google OAuth **Test users**. Each member can link up to five Gmail accounts they control and then scan the combined Inbox.
+
+## Invite a beta member
+
+1. Sign in as the beta administrator.
+2. Open **Setup**, enter the member's exact Gmail address, and choose **Invite**.
+3. Add that same address under Google Auth Platform → Audience → **Test users**.
+4. Send the member `https://clearbox.narayanhari.in`. They create their isolated workspace by signing in with the invited address.
+5. Use **Revoke** in Setup to invalidate that member's sessions and remove their linked tokens and indexed Clearbox data. Re-inviting a revoked address is supported.
+
+An app invitation does not send email and does not modify Google Cloud automatically. The administrator shares the beta URL directly with invited people.
 
 ## Safe testing sequence
 
@@ -64,7 +78,11 @@ The app never empties Gmail Trash. Gmail remains the source of truth, and messag
 
 ## Security guardrails
 
-- Only the exact address configured in `ALLOWED_GMAIL_ADDRESS` can establish the owner session. Additional Gmail accounts can be linked only from that authenticated session.
+- Only a Google-verified address with an active `beta_members` record can establish a session. The configured `BETA_ADMIN_EMAIL` is bootstrapped as the administrator.
+- Invitation creation, listing, and revocation require an active administrator session plus same-origin request validation.
+- Every Gmail account, indexed message, preview request, cleanup job, and disconnect operation remains scoped to its owning beta workspace.
+- An address invited for its own workspace cannot be captured as another member's secondary Gmail account.
+- Each workspace is limited to five linked Gmail accounts and the deployment is capped at 25 invited/active members.
 - Every dashboard, sync, Trash, Undo, and disconnect query verifies linked-account ownership on the server.
 - Mailbox-changing API requests require a same-origin action header and reject cross-origin requests.
 - Starred and important messages are excluded by the server; clients cannot override that rule.
@@ -75,6 +93,6 @@ The app never empties Gmail Trash. Gmail remains the source of truth, and messag
 
 ## Storage and privacy
 
-The local database contains each linked Gmail address, encrypted refresh token, message IDs, sender, subject, date, and labels needed for the dashboard. It does not store previews, bodies, or attachments. Short preview text is requested from Gmail only when the authenticated owner opens a sender conversation. Selecting the account control and confirming disconnect revokes access for every linked Gmail and removes all locally indexed data.
+The database contains beta membership status, each linked Gmail address, encrypted refresh token, message IDs, sender, subject, date, and labels needed for the dashboard. It does not store previews, bodies, or attachments. Short preview text is requested from Gmail only when the authenticated member opens a sender conversation. Selecting the account control and confirming disconnect always removes the workspace's stored tokens and indexed data. Clearbox also asks Google to revoke every linked grant and warns the member when Google Account permissions need manual removal.
 
-For a public launch, use a separate production Google Cloud project and complete Google's restricted-scope verification requirements before inviting users. This personal prototype intentionally has one allowlisted owner, who may link multiple Gmail accounts.
+Before a public launch, use a separate production Google Cloud project, publish privacy and data-deletion policies, and complete Google's verification requirements for the requested Gmail scope. Until then, keep membership invite-only and add every member to Google OAuth test users.

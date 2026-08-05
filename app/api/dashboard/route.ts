@@ -93,7 +93,7 @@ export async function GET(request: NextRequest) {
     connected: true,
     configured,
     mode: "live",
-    user: { email: user.email },
+    user: { email: user.email, role: user.role },
     stats: {
       total: stats?.total ?? 0,
       senders: stats?.senders ?? 0,

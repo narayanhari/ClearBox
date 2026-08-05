@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 interface SenderSummary {
   email: string;
@@ -23,7 +23,7 @@ interface DashboardData {
   connected: boolean;
   configured: boolean;
   mode: "demo" | "live";
-  user: { email: string } | null;
+  user: { email: string; role: "admin" | "member" } | null;
   stats: { total: number; unread: number; senders: number; protected: number };
   senders: SenderSummary[];
   accounts: GmailAccountSummary[];
@@ -53,6 +53,14 @@ interface ToastState {
   message: string;
   tone?: "success" | "error";
   jobIds?: string[];
+}
+
+interface BetaMember {
+  email: string;
+  role: "admin" | "member";
+  status: "invited" | "active" | "revoked";
+  invitedAt: number;
+  acceptedAt: number | null;
 }
 
 const compactNumber = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
@@ -98,6 +106,10 @@ export function MailDashboard() {
   const [cleaning, setCleaning] = useState(false);
   const [cleaningProgress, setCleaningProgress] = useState(0);
   const [setupOpen, setSetupOpen] = useState(false);
+  const [betaMembers, setBetaMembers] = useState<BetaMember[]>([]);
+  const [betaMemberLimit, setBetaMemberLimit] = useState(25);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteBusy, setInviteBusy] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
   const conversationStreamRef = useRef<HTMLDivElement | null>(null);
 
@@ -111,6 +123,21 @@ export function MailDashboard() {
       current ? nextDashboard.senders.find((sender) => sender.email === current.email) ?? null : null,
     );
   }, [selectedAccount]);
+
+  const loadBetaMembers = useCallback(async () => {
+    const response = await fetch("/api/admin/invitations", {
+      cache: "no-store",
+      headers: actionHeaders,
+    });
+    const payload = (await response.json()) as {
+      error?: string;
+      members?: BetaMember[];
+      maxMembers?: number;
+    };
+    if (!response.ok) throw new Error(payload.error ?? "Could not load beta invitations.");
+    setBetaMembers(payload.members ?? []);
+    setBetaMemberLimit(payload.maxMembers ?? 25);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -130,11 +157,15 @@ export function MailDashboard() {
       if (error === "missing-config") {
         setSetupOpen(true);
         setToast({ message: "Add your Google credentials before connecting Gmail.", tone: "error" });
-      } else if (error === "account-not-allowed") {
+      } else if (error === "invite-required" || error === "account-not-allowed") {
         setSetupOpen(true);
-        setToast({ message: "That Gmail account is not allowed for this personal prototype.", tone: "error" });
+        setToast({ message: "That Gmail address has not been invited to the beta.", tone: "error" });
       } else if (error === "account-already-linked") {
         setToast({ message: "That Gmail account is already linked to another owner.", tone: "error" });
+      } else if (error === "account-reserved") {
+        setToast({ message: "That Gmail address is reserved for its own beta workspace.", tone: "error" });
+      } else if (error === "account-limit") {
+        setToast({ message: "A beta workspace can link up to five Gmail accounts.", tone: "error" });
       } else if (error) {
         setToast({ message: "Google connection was not completed. Please try again.", tone: "error" });
       } else if (params.get("account-added")) {
@@ -147,6 +178,22 @@ export function MailDashboard() {
       }
     });
   }, []);
+
+  useEffect(() => {
+    if (!setupOpen || dashboard?.user?.role !== "admin") return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      loadBetaMembers().catch((error) => {
+        if (!cancelled) {
+          setToast({ message: error instanceof Error ? error.message : "Could not load invitations.", tone: "error" });
+        }
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [dashboard?.user?.role, loadBetaMembers, setupOpen]);
 
   useEffect(() => {
     if (!selected) return;
@@ -396,10 +443,71 @@ export function MailDashboard() {
     }
   }
 
+  async function inviteBetaMember(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setInviteBusy(true);
+    try {
+      const response = await fetch("/api/admin/invitations", {
+        method: "POST",
+        headers: { ...actionHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ email: inviteEmail }),
+      });
+      const payload = (await response.json()) as { error?: string; email?: string };
+      if (!response.ok) throw new Error(payload.error ?? "Could not create the invitation.");
+      setInviteEmail("");
+      await loadBetaMembers();
+      setToast({
+        message: `${payload.email ?? "That Gmail address"} can now join the ClearBox beta. Add it to Google OAuth test users too.`,
+        tone: "success",
+      });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : "Invitation failed", tone: "error" });
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+
+  async function revokeBetaMember(member: BetaMember) {
+    if (!window.confirm(`Revoke ClearBox beta access for ${member.email}? Their sessions, linked tokens, and indexed ClearBox data will be removed.`)) {
+      return;
+    }
+    setInviteBusy(true);
+    try {
+      const response = await fetch("/api/admin/invitations", {
+        method: "DELETE",
+        headers: { ...actionHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ email: member.email }),
+      });
+      const payload = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "Could not revoke beta access.");
+      await loadBetaMembers();
+      setToast({ message: `Beta access revoked for ${member.email}.`, tone: "success" });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : "Revocation failed", tone: "error" });
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+
   async function disconnect() {
     if (!window.confirm("Disconnect every Gmail account and remove all locally indexed metadata? Your Gmail messages will not be deleted.")) return;
-    const response = await fetch("/api/auth/disconnect", { method: "POST", headers: actionHeaders });
-    if (response.ok) window.location.reload();
+    try {
+      const response = await fetch("/api/auth/disconnect", { method: "POST", headers: actionHeaders });
+      const payload = (await response.json()) as {
+        error?: string;
+        googleAccessRevoked?: boolean;
+      };
+      if (!response.ok) throw new Error(payload.error ?? "Disconnect failed. Please retry.");
+      if (!payload.googleAccessRevoked) {
+        window.alert("ClearBox removed its local data and access. Google did not confirm every token revocation, so also remove ClearBox from your Google Account permissions.");
+      }
+      window.location.assign("/");
+    } catch (error) {
+      setToast({
+        message: error instanceof Error ? error.message : "Disconnect failed. Please retry.",
+        tone: "error",
+      });
+    }
   }
 
   if (!dashboard) {
@@ -440,7 +548,7 @@ export function MailDashboard() {
       <main className="main" id="top">
         <header className="topbar">
           <div>
-            <p className="eyebrow">PERSONAL INBOX ORGANIZER</p>
+            <p className="eyebrow">INVITE-ONLY INBOX ORGANIZER</p>
             <h1>Your inbox, finally in perspective.</h1>
           </div>
           <div className="top-actions">
@@ -466,7 +574,7 @@ export function MailDashboard() {
                 type="button"
                 onClick={() => dashboard.configured ? (window.location.href = "/api/auth/google/start") : setSetupOpen(true)}
               >
-                <span className="google-g">G</span>Connect Gmail
+                <span className="google-g">G</span>Join with invited Gmail
               </button>
             )}
           </div>
@@ -474,7 +582,7 @@ export function MailDashboard() {
 
         <section className="status-row" aria-label="Connection status">
           <span className={`mode-badge ${dashboard.connected ? "live" : "demo"}`}>
-            <i />{dashboard.connected ? "Live mailbox" : "Demo mode"}
+            <i />{dashboard.connected ? "Live beta workspace" : "Invite-only beta"}
           </span>
           <span>Last synced: {relativeTime(dashboard.lastSyncedAt)}</span>
           <span>
@@ -489,14 +597,14 @@ export function MailDashboard() {
               <span>428</span><i /><i /><i />
             </div>
             <div>
-              <p className="eyebrow">START WITH A SAFE SCAN</p>
+              <p className="eyebrow">PRIVATE BETA ACCESS</p>
               <h2>See who fills your inbox.</h2>
-              <p>Connect Gmail to group your entire Inbox by sender. Headers are indexed locally; short previews load only when you open a sender and are never stored.</p>
+              <p>Join with the exact Gmail address invited by the ClearBox administrator. Every beta member gets an isolated workspace; headers are indexed securely and previews are never stored.</p>
             </div>
             <button
               type="button"
               onClick={() => dashboard.configured ? (window.location.href = "/api/auth/google/start") : setSetupOpen(true)}
-            >Connect my Gmail <span>→</span></button>
+            >Join the beta <span>→</span></button>
           </section>
         )}
 
@@ -604,8 +712,12 @@ export function MailDashboard() {
         </section>
 
         <footer>
-          <span>Clearbox personal prototype</span>
+          <span>Clearbox invite-only beta</span>
           <span>Headers indexed · previews fetched live · Trash, never permanent delete</span>
+          <nav className="legal-links" aria-label="Legal and privacy">
+            <a href="/privacy">Privacy</a>
+            <a href="/data-deletion">Data deletion</a>
+          </nav>
         </footer>
       </main>
 
@@ -767,22 +879,91 @@ export function MailDashboard() {
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setSetupOpen(false)}>
           <section className="modal setup-modal" role="dialog" aria-modal="true" aria-labelledby="setup-title" onMouseDown={(event) => event.stopPropagation()}>
             <button className="modal-close" type="button" onClick={() => setSetupOpen(false)}>×</button>
-            <p className="eyebrow">ONE-TIME SETUP</p>
-            <h2 id="setup-title">Connect your Google project</h2>
-            <p className="modal-copy">Add these values to <code>.env.local</code>, then restart the app.</p>
-            <div className="code-block">
-              <span>GOOGLE_CLIENT_ID=…</span>
-              <span>GOOGLE_CLIENT_SECRET=…</span>
-              <span>ALLOWED_GMAIL_ADDRESS=…</span>
-              <span>APP_ENCRYPTION_KEY=…</span>
-            </div>
-            <ol className="setup-steps">
-              <li><span>1</span>Create a Google Cloud project and enable Gmail API.</li>
-              <li><span>2</span>Add yourself as an OAuth test user.</li>
-              <li><span>3</span>Add <code>http://localhost:3000/api/auth/google/callback</code> as a redirect URI.</li>
-              <li><span>4</span>Add every Gmail you want to link as a Google OAuth test user.</li>
-            </ol>
-            <a className="confirm-cleanup setup-link" href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Open Google Cloud Console <span>↗</span></a>
+            {!dashboard.configured ? (
+              <>
+                <p className="eyebrow">ONE-TIME OPERATOR SETUP</p>
+                <h2 id="setup-title">Configure the private beta</h2>
+                <p className="modal-copy">Add these values to the server environment. They are never entered by beta members.</p>
+                <div className="code-block">
+                  <span>GOOGLE_CLIENT_ID=…</span>
+                  <span>GOOGLE_CLIENT_SECRET=…</span>
+                  <span>BETA_ADMIN_EMAIL=…</span>
+                  <span>APP_ENCRYPTION_KEY=…</span>
+                </div>
+                <ol className="setup-steps">
+                  <li><span>1</span>Enable Gmail API and configure an External OAuth consent screen.</li>
+                  <li><span>2</span>Add the beta administrator as a Google OAuth test user.</li>
+                  <li><span>3</span>Add this site&apos;s <code>/api/auth/google/callback</code> URL as an authorized redirect.</li>
+                  <li><span>4</span>Keep credentials in Cloudflare secrets, never in GitHub build variables.</li>
+                </ol>
+                <a className="confirm-cleanup setup-link" href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Open Google Cloud Console <span>↗</span></a>
+              </>
+            ) : !dashboard.connected ? (
+              <>
+                <p className="eyebrow">INVITE-ONLY BETA</p>
+                <h2 id="setup-title">Use your invited Gmail</h2>
+                <p className="modal-copy">ClearBox accepts only addresses invited by the beta administrator. Sign in with that exact Google account to create your isolated workspace.</p>
+                <ul className="safety-list beta-safety-list">
+                  <li><span>✓</span>Your mailbox metadata is isolated from every other beta member.</li>
+                  <li><span>✓</span>Email bodies and attachments are not stored.</li>
+                  <li><span>✓</span>Cleanup uses Gmail Trash and protects Starred or Important messages.</li>
+                </ul>
+                <button className="confirm-cleanup" type="button" onClick={() => (window.location.href = "/api/auth/google/start")}>Continue with invited Gmail</button>
+                <p className="beta-help">If Google blocks access, ask the administrator to add your address to the project&apos;s OAuth test users.</p>
+              </>
+            ) : dashboard.user?.role === "admin" ? (
+              <>
+                <p className="eyebrow">BETA ADMINISTRATION</p>
+                <h2 id="setup-title">Invite beta members</h2>
+                <p className="modal-copy">Invite the exact Gmail address they will use. Then add the same address to Google OAuth test users while the consent screen is in Testing.</p>
+                <form className="invite-form" onSubmit={inviteBetaMember}>
+                  <label htmlFor="invite-email">Gmail address</label>
+                  <div>
+                    <input
+                      id="invite-email"
+                      type="email"
+                      autoComplete="off"
+                      maxLength={254}
+                      required
+                      value={inviteEmail}
+                      onChange={(event) => setInviteEmail(event.target.value)}
+                      placeholder="friend@gmail.com"
+                      disabled={inviteBusy}
+                    />
+                    <button type="submit" disabled={inviteBusy || !inviteEmail.trim()}>{inviteBusy ? "Saving…" : "Invite"}</button>
+                  </div>
+                </form>
+                <div className="beta-member-heading">
+                  <strong>Beta access</strong>
+                  <span>{betaMembers.filter((member) => member.role === "member" && member.status !== "revoked").length}/{betaMemberLimit} members</span>
+                </div>
+                <div className="beta-member-list">
+                  {betaMembers.map((member) => (
+                    <div className="beta-member" key={member.email}>
+                      <span className={`beta-member-status ${member.status}`} aria-label={member.status} />
+                      <div><strong>{member.email}</strong><small>{member.role === "admin" ? "Administrator" : member.status === "active" ? "Joined" : member.status === "invited" ? "Invited" : "Revoked"}</small></div>
+                      {member.role !== "admin" && member.status !== "revoked" && (
+                        <button type="button" onClick={() => revokeBetaMember(member)} disabled={inviteBusy}>Revoke</button>
+                      )}
+                    </div>
+                  ))}
+                  {!betaMembers.length && <p className="beta-help">Loading beta access…</p>}
+                </div>
+                <a className="oauth-test-link" href="https://console.cloud.google.com/auth/audience" target="_blank" rel="noreferrer">Manage Google OAuth test users <span>↗</span></a>
+              </>
+            ) : (
+              <>
+                <p className="eyebrow">YOUR BETA WORKSPACE</p>
+                <h2 id="setup-title">Private by default</h2>
+                <p className="modal-copy">Signed in as <strong>{dashboard.user?.email}</strong>. Your indexed metadata, linked Gmail accounts, and cleanup jobs are scoped only to your beta workspace.</p>
+                <ul className="safety-list beta-safety-list">
+                  <li><span>✓</span>Link up to five Gmail accounts you control.</li>
+                  <li><span>✓</span>Other beta members cannot see or modify your data.</li>
+                  <li><span>✓</span>Disconnect removes your indexed metadata from ClearBox.</li>
+                </ul>
+                <button className="confirm-cleanup" type="button" onClick={() => setSetupOpen(false)}>Back to my workspace</button>
+              </>
+            )}
           </section>
         </div>
       )}

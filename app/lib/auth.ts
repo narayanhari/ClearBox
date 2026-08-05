@@ -1,4 +1,5 @@
-import { getDatabase, getEnvironment } from "@/db/runtime";
+import { getDatabase } from "@/db/runtime";
+import { isBetaRole, type BetaRole } from "./beta-policy";
 import { randomToken, sha256 } from "./encoding";
 
 export const SESSION_COOKIE = "clearbox_session";
@@ -11,6 +12,7 @@ export function sessionCookieName(request: Request): string {
 export interface CurrentUser {
   id: string;
   email: string;
+  role: BetaRole;
   ownerUserId: string;
   refreshTokenEncrypted: string;
   lastSyncedAt: number | null;
@@ -42,10 +44,12 @@ export async function currentUser(request: Request): Promise<CurrentUser | null>
   const row = await database
     .prepare(
       `SELECT u.id, u.email, u.owner_user_id, u.refresh_token_encrypted,
-              u.last_synced_at, u.sync_status
+              u.last_synced_at, u.sync_status, b.role
        FROM sessions s
        JOIN users u ON u.id = s.user_id
-       WHERE s.id_hash = ? AND s.expires_at > ?`,
+       JOIN beta_members b ON b.email = u.email
+       WHERE s.id_hash = ? AND s.expires_at > ?
+         AND b.status = 'active' AND u.owner_user_id = u.id`,
     )
     .bind(sessionHash, now)
     .first<{
@@ -55,20 +59,14 @@ export async function currentUser(request: Request): Promise<CurrentUser | null>
       refresh_token_encrypted: string;
       last_synced_at: number | null;
       sync_status: string;
+      role: string;
     }>();
 
-  const allowedAddress = getEnvironment().ALLOWED_GMAIL_ADDRESS?.trim().toLowerCase();
-  if (
-    !row ||
-    !allowedAddress ||
-    row.email.trim().toLowerCase() !== allowedAddress ||
-    row.owner_user_id !== row.id
-  ) {
-    return null;
-  }
+  if (!row || !isBetaRole(row.role) || row.owner_user_id !== row.id) return null;
   return {
     id: row.id,
     email: row.email,
+    role: row.role,
     ownerUserId: row.id,
     refreshTokenEncrypted: row.refresh_token_encrypted,
     lastSyncedAt: row.last_synced_at,
@@ -102,6 +100,7 @@ export async function getConnectedAccounts(owner: CurrentUser): Promise<GmailAcc
   return result.results.map((row) => ({
     id: row.id,
     email: row.email,
+    role: owner.role,
     ownerUserId: row.owner_user_id,
     refreshTokenEncrypted: row.refresh_token_encrypted,
     lastSyncedAt: row.last_synced_at,

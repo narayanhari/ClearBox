@@ -189,6 +189,19 @@ h1 { margin-bottom: 0; max-width: 720px; font-family: Georgia, "Times New Roman"
 .conversation-review { border: 0; display: flex; align-items: center; gap: 8px; color: white; background: var(--ink); }
 .conversation-review span { min-width: 25px; padding: 3px 5px; border-radius: 20px; color: var(--ink); background: var(--mint); font-size: 8px; }
 footer { display: flex; justify-content: space-between; margin-top: 20px; color: #8d9793; font-size: 9px; }
+.legal-links { display: flex; gap: 12px; }.legal-links a { color: inherit; }
+
+.policy-shell { width: min(820px, calc(100% - 32px)); margin: 0 auto; padding: 58px 0 80px; }
+.policy-back { display: inline-block; margin-bottom: 45px; color: var(--mint-deep); text-decoration: none; font-size: 11px; font-weight: 800; }
+.policy-shell h1 { max-width: none; margin-bottom: 12px; }
+.policy-updated { margin-bottom: 36px; color: var(--muted); font-size: 11px; }
+.policy-shell section { padding: 23px 0; border-top: 1px solid var(--line); }
+.policy-shell section h2 { margin-bottom: 10px; font-family: Georgia, serif; font-size: 22px; font-weight: 500; }
+.policy-shell section p, .policy-shell section li { color: #53645e; font-size: 12px; line-height: 1.75; }
+.policy-shell section p:last-child { margin-bottom: 0; }
+.policy-shell section a { color: var(--mint-deep); font-weight: 750; }
+.policy-shell section ol { margin: 0 0 15px; padding-left: 22px; }
+.policy-action { display: inline-flex; margin-top: 5px; padding: 11px 14px; border-radius: 9px; color: white !important; background: var(--ink); text-decoration: none; font-size: 10px; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 50; padding: 22px; display: grid; place-items: center; background: rgba(9,27,24,.64); backdrop-filter: blur(6px); }
 .modal { width: min(460px, 100%); position: relative; padding: 31px; border-radius: 17px; background: var(--white); box-shadow: 0 35px 100px rgba(0,0,0,.3); animation: modal-in .2s ease-out; }
@@ -209,13 +222,36 @@ footer { display: flex; justify-content: space-between; margin-top: 20px; color:
 .confirm-cleanup { width: 100%; min-height: 44px; border: 0; border-radius: 9px; color: white; background: var(--ink); cursor: pointer; font-size: 11px; font-weight: 800; }
 .confirm-cleanup:hover { background: #24463f; }.confirm-cleanup:disabled { opacity: .5; cursor: wait; }
 .cancel-cleanup { width: 100%; min-height: 37px; margin-top: 5px; border: 0; color: var(--muted); background: transparent; cursor: pointer; font-size: 10px; }
-.setup-modal { width: min(510px, 100%); }
+.setup-modal { width: min(540px, 100%); max-height: min(780px, calc(100vh - 44px)); overflow-y: auto; }
 .setup-modal code { padding: 2px 4px; border-radius: 4px; color: #356e5b; background: #e5f0e9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
 .code-block { margin: 16px 0; padding: 14px; display: grid; gap: 7px; border-radius: 9px; color: #dcebe4; background: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
 .setup-steps { margin: 18px 0 22px; padding: 0; list-style: none; display: grid; gap: 12px; color: #596b65; font-size: 10px; }
 .setup-steps li { display: grid; grid-template-columns: 25px 1fr; gap: 9px; align-items: center; }.setup-steps li > span { width: 25px; height: 25px; display: grid; place-items: center; border-radius: 50%; background: var(--mint); color: var(--ink); font-weight: 850; }
 .setup-link { display: flex; align-items: center; justify-content: center; text-decoration: none; }
 .setup-link span { margin-left: 8px; }
+.beta-safety-list { margin-top: 21px; }
+.beta-help { margin: 13px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; text-align: center; }
+.invite-form { margin: 18px 0; }
+.invite-form > label { display: block; margin-bottom: 7px; color: var(--ink); font-size: 9px; font-weight: 800; }
+.invite-form > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+.invite-form input { min-width: 0; min-height: 42px; padding: 0 12px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: white; font-size: 10px; }
+.invite-form button { min-height: 42px; padding: 0 16px; border: 0; border-radius: 9px; color: white; background: var(--ink); cursor: pointer; font-size: 10px; font-weight: 800; }
+.invite-form button:disabled { opacity: .55; cursor: wait; }
+.beta-member-heading { margin: 21px 0 8px; display: flex; align-items: center; justify-content: space-between; }
+.beta-member-heading strong { font-size: 10px; }.beta-member-heading span { color: var(--muted); font-size: 8px; }
+.beta-member-list { max-height: 245px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; background: #fafbf7; }
+.beta-member { min-width: 0; padding: 10px 11px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 9px; align-items: center; border-bottom: 1px solid #e8ece6; }
+.beta-member:last-child { border-bottom: 0; }
+.beta-member-status { width: 8px; height: 8px; border-radius: 50%; background: #a7afab; }
+.beta-member-status.active { background: #35a776; box-shadow: 0 0 0 3px rgba(53,167,118,.13); }
+.beta-member-status.invited { background: #d4a839; }.beta-member-status.revoked { background: #c76850; }
+.beta-member div { min-width: 0; display: grid; gap: 3px; }
+.beta-member strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
+.beta-member small { color: var(--muted); font-size: 8px; }
+.beta-member button { border: 0; color: #aa513c; background: transparent; cursor: pointer; font-size: 8px; font-weight: 800; }
+.beta-member button:disabled { opacity: .45; cursor: wait; }
+.oauth-test-link { margin-top: 12px; display: flex; align-items: center; justify-content: center; color: var(--mint-deep); text-decoration: none; font-size: 9px; font-weight: 800; }
+.oauth-test-link span { margin-left: 6px; }
 
 .toast { position: fixed; right: 24px; bottom: 24px; z-index: 70; min-width: 300px; max-width: 440px; min-height: 54px; padding: 11px 12px; display: grid; grid-template-columns: 28px 1fr auto auto; gap: 9px; align-items: center; border-radius: 11px; color: white; background: var(--ink); box-shadow: 0 17px 50px rgba(8,29,24,.25); }
 .toast > span { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; color: var(--ink); background: var(--mint); font-size: 10px; font-weight: 900; }.toast.error > span { background: #f3a18c; }

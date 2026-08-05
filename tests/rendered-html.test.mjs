@@ -36,7 +36,7 @@ test("keeps cleanup recoverable and excludes permanent-delete access", async () 
   assert.match(cleanup, /CLEANUP_REQUEST_BATCH_SIZE = 20/);
   assert.match(cleanup, /LIMIT \$\{CLEANUP_REQUEST_BATCH_SIZE \+ 1\}/);
   assert.match(envExample, /APP_ENCRYPTION_KEY/);
-  assert.match(envExample, /ALLOWED_GMAIL_ADDRESS/);
+  assert.match(envExample, /BETA_ADMIN_EMAIL/);
   assert.match(gmail, /ON CONFLICT\(user_id, id\)/);
   assert.match(schema, /primaryKey\(\{ columns: \[table\.userId, table\.id\]/);
   await access(new URL("../public/og.png", import.meta.url));
@@ -81,7 +81,8 @@ test("enforces browser and request security controls", async () => {
   assert.match(http, /receivedOrigin !== expectedOrigin/);
   assert.match(http, /sec-fetch-site/);
   assert.match(dashboard, /x-clearbox-action/);
-  assert.match(callback, /getAllowedGmailAddress/);
+  assert.match(callback, /SELECT role, status FROM beta_members WHERE email = \?/);
+  assert.match(callback, /status !== "invited" && membership\.status !== "active"/);
   assert.match(callback, /DELETE FROM sessions WHERE user_id/);
   assert.match(config, /Content-Security-Policy/);
   assert.match(config, /frame-ancestors 'none'/);
@@ -90,6 +91,57 @@ test("enforces browser and request security controls", async () => {
 
   const dependencies = JSON.parse(packageJson);
   assert.equal(dependencies.dependencies.next, "16.2.12");
+});
+
+test("enforces invite-only beta membership and administrator-only invitation controls", async () => {
+  const [auth, callback, invitations, disconnect, runtime, schema, dashboard, privacy, deletion] = await Promise.all([
+    readFile(new URL("../app/lib/auth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/auth/google/callback/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/admin/invitations/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/auth/disconnect/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/runtime.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/MailDashboard.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/privacy/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/data-deletion/page.tsx", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(auth, /JOIN beta_members b ON b\.email = u\.email/);
+  assert.match(auth, /b\.status = 'active' AND u\.owner_user_id = u\.id/);
+  assert.match(callback, /invite-required/);
+  assert.match(callback, /account-reserved/);
+  assert.match(callback, /MAX_LINKED_GMAIL_ACCOUNTS/);
+  assert.match(callback, /activation\.meta\.changes !== 1/);
+  assert.match(callback, /WHERE \(SELECT COUNT\(\*\) FROM users WHERE owner_user_id = \?\) < \?/);
+  assert.match(callback, /JOIN users u ON u\.id = \? AND u\.owner_user_id = u\.id AND u\.email = b\.email/);
+  assert.match(callback, /const currentOwner = await currentUser\(request\)/);
+  assert.match(callback, /DELETE FROM users WHERE owner_user_id = \?/);
+  assert.match(invitations, /requireReadRequest\(request\)/);
+  assert.match(invitations, /requireActionRequest\(request\)/);
+  assert.match(invitations, /user\.role !== "admin"/);
+  assert.match(invitations, /MAX_BETA_MEMBERS/);
+  assert.match(invitations, /DELETE FROM sessions/);
+  assert.match(invitations, /DELETE FROM messages WHERE user_id IN/);
+  assert.match(invitations, /DELETE FROM users WHERE owner_user_id/);
+  assert.doesNotMatch(invitations, /beta access is already revoked/i);
+  assert.match(disconnect, /Promise\.allSettled/);
+  assert.match(disconnect, /googleAccessRevoked/);
+  assert.match(disconnect, /DELETE FROM users WHERE owner_user_id/);
+  assert.ok(disconnect.indexOf("await database.batch") < disconnect.indexOf("const revocations"));
+  assert.match(runtime, /INSERT INTO beta_members/);
+  assert.match(runtime, /role = 'admin', status = 'active'/);
+  assert.match(runtime, /WHERE role = 'admin' AND email != \?/);
+  assert.match(runtime, /UPDATE beta_members SET status = 'revoked'.*WHERE role = 'admin'/s);
+  assert.match(runtime, /DELETE FROM users WHERE owner_user_id = \?/);
+  assert.match(schema, /export const betaMembers/);
+  assert.match(dashboard, /Invite beta members/);
+  assert.match(dashboard, /Google OAuth test users/);
+  assert.match(dashboard, /payload\.googleAccessRevoked/);
+  assert.match(dashboard, /Google did not confirm every token revocation/);
+  assert.doesNotMatch(dashboard, /params\.get\("disconnected"\)/);
+  assert.match(privacy, /does not sell Gmail data/);
+  assert.match(privacy, /full message bodies or attachments/);
+  assert.match(deletion, /removes your sessions, encrypted refresh tokens/);
 });
 
 test("scans the entire Inbox and scopes multiple accounts to one owner", async () => {
