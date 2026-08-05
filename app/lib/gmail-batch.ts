@@ -1,10 +1,17 @@
 const GMAIL_MESSAGE_PATH = "/gmail/v1/users/me/messages";
 
-// Keep each Worker invocation comfortably below the free plan's 10 ms CPU
-// allowance. One small Gmail batch per sync page avoids parsing several large
-// multipart responses in the same invocation.
-export const GMAIL_METADATA_BATCH_SIZE = 20;
+// Gmail recommends no more than 50 inner requests in one multipart batch. The
+// runtime sync size defaults to 20 and may be canary-tuned up to this ceiling.
+export const GMAIL_METADATA_BATCH_MAX_SIZE = 50;
+export const DEFAULT_SYNC_BATCH_SIZE = 20;
+export const MIN_SYNC_BATCH_SIZE = 10;
 export const GMAIL_BATCH_RESPONSE_LIMIT_BYTES = 4 * 1024 * 1024;
+
+export function configuredSyncBatchSize(value: string | undefined): number {
+  if (!value || !/^\d+$/.test(value)) return DEFAULT_SYNC_BATCH_SIZE;
+  const configured = Number(value);
+  return Math.min(GMAIL_METADATA_BATCH_MAX_SIZE, Math.max(MIN_SYNC_BATCH_SIZE, configured));
+}
 
 export function isUnavailableGmailMessageStatus(status: number): boolean {
   return status === 404 || status === 410;
@@ -40,14 +47,18 @@ function responseBoundary(contentType: string): string {
 }
 
 function splitBlock(value: string): [string, string] {
-  const separator = value.indexOf("\n\n");
-  if (separator < 0) throw new Error("Gmail batch response part was malformed.");
-  return [value.slice(0, separator), value.slice(separator + 2)];
+  const crlfSeparator = value.indexOf("\r\n\r\n");
+  if (crlfSeparator >= 0) {
+    return [value.slice(0, crlfSeparator), value.slice(crlfSeparator + 4)];
+  }
+  const lfSeparator = value.indexOf("\n\n");
+  if (lfSeparator < 0) throw new Error("Gmail batch response part was malformed.");
+  return [value.slice(0, lfSeparator), value.slice(lfSeparator + 2)];
 }
 
 function headers(block: string): Map<string, string> {
   const parsed = new Map<string, string>();
-  for (const line of block.split("\n")) {
+  for (const line of block.split(/\r?\n/)) {
     const separator = line.indexOf(":");
     if (separator <= 0) continue;
     const name = line.slice(0, separator).trim().toLowerCase();
@@ -65,16 +76,16 @@ function normalizedContentId(value: string): string {
 }
 
 export function createGmailMetadataBatch(messageIds: string[]): GmailBatchRequest {
-  if (!messageIds.length || messageIds.length > GMAIL_METADATA_BATCH_SIZE) {
-    throw new Error(`Gmail metadata batches must contain 1-${GMAIL_METADATA_BATCH_SIZE} messages.`);
+  if (!messageIds.length || messageIds.length > GMAIL_METADATA_BATCH_MAX_SIZE) {
+    throw new Error(`Gmail metadata batches must contain 1-${GMAIL_METADATA_BATCH_MAX_SIZE} messages.`);
   }
 
   const boundary = `clearbox_${crypto.randomUUID().replaceAll("-", "")}`;
   const params = new URLSearchParams({
     format: "metadata",
-    fields: "id,threadId,labelIds,historyId,internalDate,payload/headers",
+    fields: "id,threadId,labelIds,internalDate,payload/headers",
   });
-  for (const name of ["From", "Subject", "Date"]) params.append("metadataHeaders", name);
+  for (const name of ["From", "Subject"]) params.append("metadataHeaders", name);
 
   const parts = messageIds.map((messageId, index) => {
     if (!messageId || messageId.length > 256 || /[\r\n]/.test(messageId)) {
@@ -116,9 +127,18 @@ export function parseGmailBatchResponse(
   }
 
   const responses = new Map<string, GmailBatchResponsePart>();
-  for (const rawPart of body.split(`--${boundary}`)) {
-    const normalized = rawPart.replaceAll("\r\n", "\n").trim();
-    if (!normalized || normalized === "--") continue;
+  const marker = `--${boundary}`;
+  let cursor = 0;
+  while (true) {
+    const markerStart = body.indexOf(marker, cursor);
+    if (markerStart < 0) break;
+    const partStart = markerStart + marker.length;
+    if (body.startsWith("--", partStart)) break;
+    const nextMarker = body.indexOf(marker, partStart);
+    if (nextMarker < 0) throw new Error("Gmail batch response was malformed.");
+    cursor = nextMarker;
+    const normalized = body.slice(partStart, nextMarker).trim();
+    if (!normalized) continue;
 
     const [partHeaderBlock, nestedResponse] = splitBlock(normalized);
     const partHeaders = headers(partHeaderBlock);
@@ -132,7 +152,8 @@ export function parseGmailBatchResponse(
     }
 
     const [statusAndHeaders, responseBody] = splitBlock(nestedResponse);
-    const statusLine = statusAndHeaders.split("\n", 1)[0];
+    const firstLineEnd = statusAndHeaders.indexOf("\n");
+    const statusLine = (firstLineEnd < 0 ? statusAndHeaders : statusAndHeaders.slice(0, firstLineEnd)).trim();
     const statusMatch = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})(?:\s|$)/i);
     if (!statusMatch) throw new Error("Gmail batch response status was invalid.");
 

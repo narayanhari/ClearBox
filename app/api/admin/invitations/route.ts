@@ -148,6 +148,9 @@ export async function DELETE(request: NextRequest) {
       statements.push(
         database.prepare("DELETE FROM cleanup_jobs WHERE user_id = ?").bind(owner.id),
         database
+          .prepare("DELETE FROM sync_chunks WHERE user_id IN (SELECT id FROM users WHERE owner_user_id = ?)")
+          .bind(owner.id),
+        database
           .prepare("DELETE FROM messages WHERE user_id IN (SELECT id FROM users WHERE owner_user_id = ?)")
           .bind(owner.id),
         database.prepare("DELETE FROM sessions WHERE user_id = ?").bind(owner.id),

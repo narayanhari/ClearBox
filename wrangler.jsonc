@@ -6,6 +6,9 @@
   "compatibility_flags": ["nodejs_compat"],
   "minify": true,
   "workers_dev": false,
+  "vars": {
+    "SYNC_BATCH_SIZE": "20"
+  },
   "routes": [
     {
       "pattern": "clearbox.narayanhari.in",

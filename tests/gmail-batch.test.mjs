@@ -2,11 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  configuredSyncBatchSize,
   createGmailMetadataBatch,
-  GMAIL_METADATA_BATCH_SIZE,
+  DEFAULT_SYNC_BATCH_SIZE,
+  GMAIL_METADATA_BATCH_MAX_SIZE,
   isUnavailableGmailMessageStatus,
   parseGmailBatchResponse,
 } from "../app/lib/gmail-batch.ts";
+
+test("keeps runtime sync batches inside the measured Gmail and Worker bounds", () => {
+  assert.equal(configuredSyncBatchSize(undefined), DEFAULT_SYNC_BATCH_SIZE);
+  assert.equal(configuredSyncBatchSize("not-a-number"), DEFAULT_SYNC_BATCH_SIZE);
+  assert.equal(configuredSyncBatchSize("5"), 10);
+  assert.equal(configuredSyncBatchSize("30"), 30);
+  assert.equal(configuredSyncBatchSize("250"), 50);
+});
 
 function multipartResponse(boundary, parts) {
   return [
@@ -32,15 +42,16 @@ test("creates metadata-only Gmail batches without exposing authorization", () =>
   assert.match(batch.contentType, /^multipart\/mixed; boundary=clearbox_[a-f0-9]+$/);
   assert.match(batch.body, /format=metadata/);
   assert.match(batch.body, /metadataHeaders=From/);
-  assert.match(batch.body, /fields=id%2CthreadId%2ClabelIds%2ChistoryId%2CinternalDate%2Cpayload%2Fheaders/);
+  assert.match(batch.body, /fields=id%2CthreadId%2ClabelIds%2CinternalDate%2Cpayload%2Fheaders/);
+  assert.doesNotMatch(batch.body, /historyId|metadataHeaders=Date/);
   assert.match(batch.body, /message%2Fwith%20space/);
   assert.doesNotMatch(batch.body, /authorization|bearer/i);
 });
 
 test("rejects oversized request batches and header injection identifiers", () => {
-  assert.equal(GMAIL_METADATA_BATCH_SIZE, 20);
+  assert.equal(GMAIL_METADATA_BATCH_MAX_SIZE, 50);
   assert.throws(
-    () => createGmailMetadataBatch(Array.from({ length: GMAIL_METADATA_BATCH_SIZE + 1 }, (_, index) => `${index}`)),
+    () => createGmailMetadataBatch(Array.from({ length: GMAIL_METADATA_BATCH_MAX_SIZE + 1 }, (_, index) => `${index}`)),
     /must contain/,
   );
   assert.throws(() => createGmailMetadataBatch(["safe\r\nInjected: yes"]), /invalid message identifier/);

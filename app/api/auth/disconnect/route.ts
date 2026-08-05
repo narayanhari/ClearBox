@@ -23,6 +23,9 @@ export async function POST(request: NextRequest) {
     await database.batch([
       database.prepare("DELETE FROM cleanup_jobs WHERE user_id = ?").bind(user.id),
       database
+        .prepare("DELETE FROM sync_chunks WHERE user_id IN (SELECT id FROM users WHERE owner_user_id = ?)")
+        .bind(user.id),
+      database
         .prepare("DELETE FROM messages WHERE user_id IN (SELECT id FROM users WHERE owner_user_id = ?)")
         .bind(user.id),
       database.prepare("DELETE FROM sessions WHERE user_id = ?").bind(user.id),

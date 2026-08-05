@@ -59,13 +59,17 @@ test("keeps Gmail work inside Cloudflare free-tier request ceilings", async () =
     readFile(new URL("../app/api/cleanup/trash/route.ts", import.meta.url), "utf8"),
   ]);
 
-  assert.match(gmail, /SYNC_PAGE_SIZE = GMAIL_METADATA_BATCH_SIZE/);
-  assert.match(gmail, /GMAIL_READ_BATCH_CONCURRENCY = 1/);
+  assert.match(gmail, /GMAIL_LIST_PAGE_SIZE = 500/);
+  assert.match(gmail, /FROM sync_chunks WHERE user_id = \?/);
+  assert.match(gmail, /chunkIds\.slice\(chunk\.cursor, chunk\.cursor \+ getSyncBatchSize\(\)\)/);
+  assert.match(gmail, /FROM json_each\(\?\) AS item/);
+  assert.match(gmail, /ACTIVE_LINKED_ACCOUNT_PREDICATE/);
   assert.match(gmail, /SYNC_LOCK_LEASE_MS = 60_000/);
   assert.match(gmail, /MAX_ACCESS_TOKEN_CACHE_ENTRIES = 150/);
   assert.match(gmail, /accessTokenCache/);
   assert.match(gmail, /GMAIL_MUTATION_CONCURRENCY = 6/);
-  assert.match(gmailBatch, /GMAIL_METADATA_BATCH_SIZE = 20/);
+  assert.match(gmailBatch, /GMAIL_METADATA_BATCH_MAX_SIZE = 50/);
+  assert.match(gmailBatch, /DEFAULT_SYNC_BATCH_SIZE = 20/);
   assert.match(gmailBatch, /payload\/headers/);
   assert.match(cleanup, /CLEANUP_REQUEST_BATCH_SIZE = 20/);
 });
@@ -124,11 +128,13 @@ test("enforces invite-only beta membership and administrator-only invitation con
   assert.match(invitations, /user\.role !== "admin"/);
   assert.match(invitations, /MAX_BETA_MEMBERS/);
   assert.match(invitations, /DELETE FROM sessions/);
+  assert.match(invitations, /DELETE FROM sync_chunks/);
   assert.match(invitations, /DELETE FROM messages WHERE user_id IN/);
   assert.match(invitations, /DELETE FROM users WHERE owner_user_id/);
   assert.doesNotMatch(invitations, /beta access is already revoked/i);
   assert.match(disconnect, /Promise\.allSettled/);
   assert.match(disconnect, /googleAccessRevoked/);
+  assert.match(disconnect, /DELETE FROM sync_chunks/);
   assert.match(disconnect, /DELETE FROM users WHERE owner_user_id/);
   assert.ok(disconnect.indexOf("await database.batch") < disconnect.indexOf("const revocations"));
   assert.match(runtime, /INSERT INTO beta_members/);
@@ -137,6 +143,7 @@ test("enforces invite-only beta membership and administrator-only invitation con
   assert.match(runtime, /UPDATE beta_members SET status = 'revoked'.*WHERE role = 'admin'/s);
   assert.match(runtime, /DELETE FROM users WHERE owner_user_id = \?/);
   assert.match(schema, /export const betaMembers/);
+  assert.match(schema, /export const syncChunks/);
   assert.match(dashboard, /Invite beta members/);
   assert.match(dashboard, /Google OAuth test users/);
   assert.match(dashboard, /payload\.googleAccessRevoked/);
@@ -178,9 +185,9 @@ test("shows progressive results and retries temporary Gmail throttling", async (
   assert.match(dashboard, /response\.status === 503/);
   assert.match(dashboard, /SYNC_STATUS_RETRY_LIMIT = 6/);
   assert.match(dashboard, /SYNC_LOCK_RETRY_LIMIT = 15/);
-  assert.match(dashboard, /PROGRESSIVE_DASHBOARD_PAGE_INTERVAL = 25/);
+  assert.match(dashboard, /PROGRESSIVE_DASHBOARD_REFRESH_MS = 15_000/);
   assert.match(dashboard, /readApiJson/);
-  assert.match(dashboard, /pageCount === 1/);
+  assert.match(dashboard, /Date\.now\(\) - lastDashboardRefreshAt >= PROGRESSIVE_DASHBOARD_REFRESH_MS/);
   assert.match(dashboard, /await loadDashboard\(\)/);
 });
 

@@ -226,6 +226,9 @@ export async function GET(request: NextRequest) {
       await database.batch([
         database.prepare("DELETE FROM cleanup_jobs WHERE user_id = ?").bind(checkedOwnerId),
         database
+          .prepare("DELETE FROM sync_chunks WHERE user_id IN (SELECT id FROM users WHERE owner_user_id = ?)")
+          .bind(checkedOwnerId),
+        database
           .prepare("DELETE FROM messages WHERE user_id IN (SELECT id FROM users WHERE owner_user_id = ?)")
           .bind(checkedOwnerId),
         database.prepare("DELETE FROM sessions WHERE user_id = ?").bind(checkedOwnerId),

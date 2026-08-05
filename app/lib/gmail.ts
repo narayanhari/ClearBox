@@ -4,21 +4,18 @@ import { getDatabase, getEnvironment } from "@/db/runtime";
 import { PublicHttpError } from "./http";
 import { isBetaAccessConfigured } from "./beta";
 import {
+  configuredSyncBatchSize,
   createGmailMetadataBatch,
   GMAIL_BATCH_RESPONSE_LIMIT_BYTES,
-  GMAIL_METADATA_BATCH_SIZE,
   isUnavailableGmailMessageStatus,
   parseGmailBatchResponse,
 } from "./gmail-batch";
 
 const GMAIL_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me";
 const GMAIL_BATCH_ROOT = "https://gmail.googleapis.com/batch";
-// The Workers Free plan allows only 10 ms of CPU per invocation. Keep one
-// small metadata batch per page; the browser immediately requests the next
-// resumable page, so throughput stays high without one invocation doing a
-// large parse and D1 write burst.
-const SYNC_PAGE_SIZE = GMAIL_METADATA_BATCH_SIZE;
-const GMAIL_READ_BATCH_CONCURRENCY = 1;
+// Discover IDs in large, cheap pages, then consume one bounded metadata slice
+// per Worker invocation. This avoids repeating messages.list for every slice.
+export const GMAIL_LIST_PAGE_SIZE = 500;
 const GMAIL_BATCH_MAX_ATTEMPTS = 1;
 const GMAIL_REQUEST_TIMEOUT_MS = 15_000;
 const SYNC_LOCK_LEASE_MS = 60_000;
@@ -27,7 +24,16 @@ const MAX_ACCESS_TOKEN_CACHE_ENTRIES = 150;
 const GMAIL_MUTATION_CONCURRENCY = 6;
 const MAX_FROM_HEADER_LENGTH = 1_000;
 const MAX_SUBJECT_LENGTH = 2_000;
-const MAX_DATE_HEADER_LENGTH = 256;
+const MAX_GMAIL_PAGE_TOKEN_LENGTH = 4_096;
+const ACTIVE_LINKED_ACCOUNT_PREDICATE = `EXISTS (
+  SELECT 1
+  FROM users linked_account
+  JOIN users owner
+    ON owner.id = linked_account.owner_user_id AND owner.owner_user_id = owner.id
+  JOIN beta_members membership
+    ON membership.email = owner.email AND membership.status = 'active'
+  WHERE linked_account.id = ?
+)`;
 
 interface CachedAccessToken {
   token: string;
@@ -50,7 +56,6 @@ interface GmailMessageResponse {
   threadId: string;
   snippet?: string;
   labelIds?: string[];
-  historyId?: string;
   internalDate?: string;
   payload?: {
     headers?: Array<{ name: string; value: string }>;
@@ -68,7 +73,13 @@ export interface IndexedMessage {
   isStarred: boolean;
   isImportant: boolean;
   labels: string[];
-  historyId?: string;
+}
+
+interface SyncChunkRow {
+  run_id: string;
+  message_ids_json: string;
+  cursor: number;
+  next_page_token: string | null;
 }
 
 export interface GmailMessagePreview {
@@ -82,6 +93,10 @@ function googleConfig(): { clientId: string; clientSecret: string } {
     throw new Error("Google OAuth is not configured yet.");
   }
   return { clientId: GOOGLE_CLIENT_ID, clientSecret: GOOGLE_CLIENT_SECRET };
+}
+
+export function getSyncBatchSize(): number {
+  return configuredSyncBatchSize(getEnvironment().SYNC_BATCH_SIZE);
 }
 
 export function isGoogleConfigured(): boolean {
@@ -192,12 +207,9 @@ function indexMessage(message: GmailMessageResponse): IndexedMessage | null {
   if (!sender.email.includes("@")) return null;
   const labels = message.labelIds ?? [];
   const internalDate = Number(message.internalDate);
-  const parsedDate = Date.parse(boundedHeader(message, "Date", MAX_DATE_HEADER_LENGTH));
   const receivedAt = Number.isFinite(internalDate) && internalDate > 0
     ? internalDate
-    : Number.isFinite(parsedDate)
-      ? parsedDate
-      : Date.now();
+    : Date.now();
   return {
     id: message.id,
     threadId: message.threadId,
@@ -209,7 +221,6 @@ function indexMessage(message: GmailMessageResponse): IndexedMessage | null {
     isStarred: labels.includes("STARRED"),
     isImportant: labels.includes("IMPORTANT"),
     labels,
-    historyId: message.historyId,
   };
 }
 
@@ -222,7 +233,6 @@ function isGmailMessageResponse(value: unknown, expectedId: string): value is Gm
       return false;
     }
   }
-  if (message.historyId !== undefined && typeof message.historyId !== "string") return false;
   if (message.internalDate !== undefined && typeof message.internalDate !== "string") return false;
   if (message.payload !== undefined) {
     if (!message.payload || typeof message.payload !== "object") return false;
@@ -377,14 +387,8 @@ async function fetchGmailMetadataBatch(
 }
 
 async function fetchGmailMetadata(accessToken: string, messageIds: string[]): Promise<GmailMessageResponse[]> {
-  const batches: string[][] = [];
-  for (let offset = 0; offset < messageIds.length; offset += GMAIL_METADATA_BATCH_SIZE) {
-    batches.push(messageIds.slice(offset, offset + GMAIL_METADATA_BATCH_SIZE));
-  }
-  const results = await mapWithConcurrency(batches, GMAIL_READ_BATCH_CONCURRENCY, (batch) =>
-    fetchGmailMetadataBatch(accessToken, batch),
-  );
-  return results.flat();
+  if (!messageIds.length) return [];
+  return fetchGmailMetadataBatch(accessToken, messageIds);
 }
 
 async function mapWithConcurrency<T, R>(
@@ -410,15 +414,120 @@ export interface SyncPageResult {
   complete: boolean;
 }
 
+function normalizedListPage(page: GmailListResponse): { ids: string[]; nextPageToken: string | null } {
+  if (!page || typeof page !== "object") {
+    throw new PublicHttpError(502, "Gmail returned an invalid message list.");
+  }
+  const rawMessages = page.messages ?? [];
+  if (!Array.isArray(rawMessages) || rawMessages.length > GMAIL_LIST_PAGE_SIZE) {
+    throw new PublicHttpError(502, "Gmail returned an invalid message list.");
+  }
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const message of rawMessages) {
+    const id = message?.id;
+    if (typeof id !== "string" || !id || id.length > 256 || /[\r\n]/.test(id)) {
+      throw new PublicHttpError(502, "Gmail returned an invalid message identifier.");
+    }
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  const nextPageToken = page.nextPageToken ?? null;
+  if (
+    nextPageToken !== null &&
+    (typeof nextPageToken !== "string" || !nextPageToken || nextPageToken.length > MAX_GMAIL_PAGE_TOKEN_LENGTH)
+  ) {
+    throw new PublicHttpError(502, "Gmail returned an invalid page token.");
+  }
+  return { ids, nextPageToken };
+}
+
+function parseSyncChunkIds(chunk: SyncChunkRow): string[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(chunk.message_ids_json);
+  } catch {
+    throw new Error("Stored Gmail sync chunk was invalid.");
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length > GMAIL_LIST_PAGE_SIZE ||
+    !value.every((id) => typeof id === "string" && id.length > 0 && id.length <= 256 && !/[\r\n]/.test(id)) ||
+    !Number.isInteger(chunk.cursor) ||
+    chunk.cursor < 0 ||
+    chunk.cursor > value.length
+  ) {
+    throw new Error("Stored Gmail sync chunk was invalid.");
+  }
+  return value;
+}
+
+function bulkUpsertMessages(
+  database: D1Database,
+  accountId: string,
+  syncRunId: string,
+  indexed: IndexedMessage[],
+): D1PreparedStatement | null {
+  if (!indexed.length) return null;
+  const rows = indexed.map((message) => ({
+    id: message.id,
+    threadId: message.threadId,
+    senderEmail: message.senderEmail,
+    senderName: message.senderName,
+    subject: message.subject,
+    receivedAt: message.receivedAt,
+    isUnread: message.isUnread ? 1 : 0,
+    isStarred: message.isStarred ? 1 : 0,
+    isImportant: message.isImportant ? 1 : 0,
+    labelsJson: JSON.stringify(message.labels),
+  }));
+  return database
+    .prepare(
+      `INSERT INTO messages (
+        id, user_id, thread_id, sender_email, sender_name, subject, received_at,
+        is_unread, is_starred, is_important, labels_json, sync_run_id, trashed_at
+      )
+      SELECT
+        json_extract(item.value, '$.id'), ?,
+        json_extract(item.value, '$.threadId'),
+        json_extract(item.value, '$.senderEmail'),
+        json_extract(item.value, '$.senderName'),
+        json_extract(item.value, '$.subject'),
+        json_extract(item.value, '$.receivedAt'),
+        json_extract(item.value, '$.isUnread'),
+        json_extract(item.value, '$.isStarred'),
+        json_extract(item.value, '$.isImportant'),
+        json_extract(item.value, '$.labelsJson'), ?, NULL
+      FROM json_each(?) AS item
+      WHERE ${ACTIVE_LINKED_ACCOUNT_PREDICATE}
+      ON CONFLICT(user_id, id) DO UPDATE SET
+        thread_id = excluded.thread_id,
+        sender_email = excluded.sender_email,
+        sender_name = excluded.sender_name,
+        subject = excluded.subject,
+        received_at = excluded.received_at,
+        is_unread = excluded.is_unread,
+        is_starred = excluded.is_starred,
+        is_important = excluded.is_important,
+        labels_json = excluded.labels_json,
+        sync_run_id = excluded.sync_run_id,
+        trashed_at = NULL`,
+    )
+    .bind(accountId, syncRunId, JSON.stringify(rows), accountId);
+}
+
 export async function syncMailboxPage(account: GmailAccount): Promise<SyncPageResult> {
   const database = await getDatabase();
   const now = Date.now();
   const lock = await database
     .prepare(
       `UPDATE users SET sync_status = 'syncing', updated_at = ?
-       WHERE id = ? AND (sync_status != 'syncing' OR updated_at < ?)`,
+       WHERE id = ? AND (sync_status != 'syncing' OR updated_at < ?)
+         AND ${ACTIVE_LINKED_ACCOUNT_PREDICATE}`,
     )
-    .bind(now, account.id, now - SYNC_LOCK_LEASE_MS)
+    .bind(now, account.id, now - SYNC_LOCK_LEASE_MS, account.id)
     .run();
   if (lock.meta.changes === 0) {
     throw new PublicHttpError(409, "A mailbox scan is already in progress.");
@@ -429,83 +538,180 @@ export async function syncMailboxPage(account: GmailAccount): Promise<SyncPageRe
 
   try {
     const accessToken = await refreshAccessToken(account.refreshTokenEncrypted);
-    const params = new URLSearchParams({ maxResults: SYNC_PAGE_SIZE.toString() });
-    params.append("labelIds", "INBOX");
-    if (account.syncPageToken) params.set("pageToken", account.syncPageToken);
-    const page = await gmailFetch<GmailListResponse>(accessToken, `/messages?${params.toString()}`);
-    const ids = page.messages ?? [];
-
-    const rawMessages = await fetchGmailMetadata(accessToken, ids.map(({ id }) => id));
-    const indexed = rawMessages.map(indexMessage).filter((message): message is IndexedMessage => Boolean(message));
-
-    for (let offset = 0; offset < indexed.length; offset += 50) {
-      const batch = indexed.slice(offset, offset + 50).map((message) =>
-        database
-          .prepare(
-            `INSERT INTO messages (
-              id, user_id, thread_id, sender_email, sender_name, subject, received_at,
-              is_unread, is_starred, is_important, labels_json, sync_run_id, trashed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            ON CONFLICT(user_id, id) DO UPDATE SET
-              thread_id = excluded.thread_id,
-              sender_email = excluded.sender_email,
-              sender_name = excluded.sender_name,
-              subject = excluded.subject,
-              received_at = excluded.received_at,
-              is_unread = excluded.is_unread,
-              is_starred = excluded.is_starred,
-              is_important = excluded.is_important,
-              labels_json = excluded.labels_json,
-              sync_run_id = excluded.sync_run_id,
-              trashed_at = NULL`,
-          )
-          .bind(
-            message.id,
-            account.id,
-            message.threadId,
-            message.senderEmail,
-            message.senderName,
-            message.subject,
-            message.receivedAt,
-            message.isUnread ? 1 : 0,
-            message.isStarred ? 1 : 0,
-            message.isImportant ? 1 : 0,
-            JSON.stringify(message.labels),
-            syncRunId,
-          ),
-      );
-      await database.batch(batch);
+    let chunk = await database
+      .prepare(
+        `SELECT run_id, message_ids_json, cursor, next_page_token
+         FROM sync_chunks WHERE user_id = ?`,
+      )
+      .bind(account.id)
+      .first<SyncChunkRow>();
+    if (chunk && chunk.run_id !== syncRunId) {
+      await database.prepare("DELETE FROM sync_chunks WHERE user_id = ?").bind(account.id).run();
+      chunk = null;
     }
 
+    if (!chunk) {
+      const params = new URLSearchParams({ maxResults: GMAIL_LIST_PAGE_SIZE.toString() });
+      params.append("labelIds", "INBOX");
+      if (account.syncPageToken) params.set("pageToken", account.syncPageToken);
+      const page = normalizedListPage(
+        await gmailFetch<GmailListResponse>(accessToken, `/messages?${params.toString()}`),
+      );
+
+      if (!page.ids.length) {
+        if (page.nextPageToken) {
+          const advance = await database
+            .prepare(
+              `UPDATE users
+               SET sync_status = 'pending', sync_page_token = ?, active_sync_run_id = ?,
+                   sync_indexed_count = ?, updated_at = ?
+               WHERE id = ? AND ${ACTIVE_LINKED_ACCOUNT_PREDICATE}`,
+            )
+            .bind(page.nextPageToken, syncRunId, indexedBefore, Date.now(), account.id, account.id)
+            .run();
+          if (advance.meta.changes !== 1) {
+            throw new PublicHttpError(401, "The Gmail account was disconnected during synchronization.");
+          }
+          return { indexedThisPage: 0, indexedTotal: indexedBefore, complete: false };
+        }
+        await database.batch([
+          database.prepare("DELETE FROM sync_chunks WHERE user_id = ?").bind(account.id),
+          database
+            .prepare("DELETE FROM messages WHERE user_id = ? AND sync_run_id != ?")
+            .bind(account.id, syncRunId),
+          database
+            .prepare(
+              `UPDATE users
+               SET last_synced_at = ?, sync_status = 'idle', sync_page_token = NULL,
+                   active_sync_run_id = NULL, sync_indexed_count = 0, updated_at = ?
+               WHERE id = ?`,
+            )
+            .bind(Date.now(), Date.now(), account.id),
+        ]);
+        return { indexedThisPage: 0, indexedTotal: indexedBefore, complete: true };
+      }
+
+      const chunkNow = Date.now();
+      const [chunkWrite, accountWrite] = await database.batch([
+        database
+          .prepare(
+            `INSERT INTO sync_chunks (
+              user_id, run_id, message_ids_json, cursor, next_page_token, created_at, updated_at
+            )
+            SELECT ?, ?, ?, 0, ?, ?, ?
+            WHERE ${ACTIVE_LINKED_ACCOUNT_PREDICATE}
+            ON CONFLICT(user_id) DO UPDATE SET
+              run_id = excluded.run_id,
+              message_ids_json = excluded.message_ids_json,
+              cursor = 0,
+              next_page_token = excluded.next_page_token,
+              created_at = excluded.created_at,
+              updated_at = excluded.updated_at`,
+          )
+          .bind(
+            account.id,
+            syncRunId,
+            JSON.stringify(page.ids),
+            page.nextPageToken,
+            chunkNow,
+            chunkNow,
+            account.id,
+          ),
+        database
+          .prepare(
+            `UPDATE users
+             SET active_sync_run_id = ?, sync_indexed_count = ?, updated_at = ?
+             WHERE id = ? AND ${ACTIVE_LINKED_ACCOUNT_PREDICATE}`,
+          )
+          .bind(syncRunId, indexedBefore, chunkNow, account.id, account.id),
+      ]);
+      if (chunkWrite.meta.changes !== 1 || accountWrite.meta.changes !== 1) {
+        throw new PublicHttpError(401, "The Gmail account was disconnected during synchronization.");
+      }
+      chunk = {
+        run_id: syncRunId,
+        message_ids_json: JSON.stringify(page.ids),
+        cursor: 0,
+        next_page_token: page.nextPageToken,
+      };
+    }
+
+    let chunkIds: string[];
+    try {
+      chunkIds = parseSyncChunkIds(chunk);
+    } catch (error) {
+      await database.prepare("DELETE FROM sync_chunks WHERE user_id = ?").bind(account.id).run();
+      throw error;
+    }
+    const messageIds = chunkIds.slice(chunk.cursor, chunk.cursor + getSyncBatchSize());
+    const rawMessages = await fetchGmailMetadata(accessToken, messageIds);
+    const indexed = rawMessages.map(indexMessage).filter((message): message is IndexedMessage => Boolean(message));
     const indexedTotal = indexedBefore + indexed.length;
-    if (page.nextPageToken) {
-      await database
-        .prepare(
-          `UPDATE users
-           SET sync_status = 'pending', sync_page_token = ?, active_sync_run_id = ?,
-               sync_indexed_count = ?, updated_at = ?
-           WHERE id = ?`,
-        )
-        .bind(page.nextPageToken, syncRunId, indexedTotal, Date.now(), account.id)
-        .run();
+    const nextCursor = chunk.cursor + messageIds.length;
+    const statements: D1PreparedStatement[] = [];
+    const upsert = bulkUpsertMessages(database, account.id, syncRunId, indexed);
+    if (upsert) statements.push(upsert);
+
+    if (nextCursor < chunkIds.length) {
+      statements.push(
+        database
+          .prepare(
+            `UPDATE sync_chunks SET cursor = ?, updated_at = ?
+             WHERE user_id = ? AND run_id = ? AND ${ACTIVE_LINKED_ACCOUNT_PREDICATE}`,
+          )
+          .bind(nextCursor, Date.now(), account.id, syncRunId, account.id),
+        database
+          .prepare(
+            `UPDATE users
+             SET sync_status = 'pending', active_sync_run_id = ?, sync_indexed_count = ?, updated_at = ?
+             WHERE id = ? AND ${ACTIVE_LINKED_ACCOUNT_PREDICATE}`,
+          )
+          .bind(syncRunId, indexedTotal, Date.now(), account.id, account.id),
+      );
+      const progress = await database.batch(statements);
+      if (progress.at(-1)?.meta.changes !== 1) {
+        throw new PublicHttpError(401, "The Gmail account was disconnected during synchronization.");
+      }
       return { indexedThisPage: indexed.length, indexedTotal, complete: false };
     }
 
-    await database
-      .prepare("DELETE FROM messages WHERE user_id = ? AND sync_run_id != ?")
-      .bind(account.id, syncRunId)
-      .run();
-    const newestHistoryId = rawMessages.find((message) => message.historyId)?.historyId ?? null;
-    await database
-      .prepare(
-        `UPDATE users
-         SET history_id = COALESCE(?, history_id), last_synced_at = ?, sync_status = 'idle',
-             sync_page_token = NULL, active_sync_run_id = NULL, sync_indexed_count = 0,
-             updated_at = ?
-         WHERE id = ?`,
-      )
-      .bind(newestHistoryId, Date.now(), Date.now(), account.id)
-      .run();
+    statements.push(
+      database
+        .prepare("DELETE FROM sync_chunks WHERE user_id = ? AND run_id = ?")
+        .bind(account.id, syncRunId),
+    );
+    if (chunk.next_page_token) {
+      statements.push(
+        database
+          .prepare(
+            `UPDATE users
+             SET sync_status = 'pending', sync_page_token = ?, active_sync_run_id = ?,
+                 sync_indexed_count = ?, updated_at = ?
+             WHERE id = ? AND ${ACTIVE_LINKED_ACCOUNT_PREDICATE}`,
+          )
+          .bind(chunk.next_page_token, syncRunId, indexedTotal, Date.now(), account.id, account.id),
+      );
+      const progress = await database.batch(statements);
+      if (progress.at(-1)?.meta.changes !== 1) {
+        throw new PublicHttpError(401, "The Gmail account was disconnected during synchronization.");
+      }
+      return { indexedThisPage: indexed.length, indexedTotal, complete: false };
+    }
+
+    statements.push(
+      database
+        .prepare("DELETE FROM messages WHERE user_id = ? AND sync_run_id != ?")
+        .bind(account.id, syncRunId),
+      database
+        .prepare(
+          `UPDATE users
+           SET last_synced_at = ?, sync_status = 'idle', sync_page_token = NULL,
+               active_sync_run_id = NULL, sync_indexed_count = 0, updated_at = ?
+           WHERE id = ?`,
+        )
+        .bind(Date.now(), Date.now(), account.id),
+    );
+    await database.batch(statements);
     return { indexedThisPage: indexed.length, indexedTotal, complete: true };
   } catch (error) {
     await database

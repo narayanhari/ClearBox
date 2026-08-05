@@ -7,7 +7,7 @@ Clearbox groups Gmail messages by exact sender address, ranks senders by message
 - Responsive sender dashboard with useful demo data before Gmail is connected.
 - Google OAuth with PKCE, state validation, an encrypted refresh token, and an HTTP-only session cookie.
 - A resumable metadata-only scan of every message currently in Gmail Inbox.
-- Free-tier-safe sync pages that process one 20-message Gmail metadata batch per Worker invocation, automatically retry transient failures, and recover abandoned scan locks after one minute.
+- Free-tier-safe sync pages that discover up to 500 Gmail IDs at a time, persist an account-scoped resumable chunk, and process one configurable 10-50-message metadata batch per Worker invocation.
 - Multiple Gmail accounts linked under one locally authenticated owner.
 - Email-verified invitations, administrator/member roles, immediate session revocation, and isolated workspaces for up to 25 beta members.
 - Exact sender grouping across all linked accounts, unread counts, protected-message counts, mailbox filtering, sender search, and sorting.
@@ -77,13 +77,14 @@ An app invitation does not send email and does not modify Google Cloud automatic
 
 The app never empties Gmail Trash. Gmail remains the source of truth, and messages moved to Trash stay recoverable through Gmail.
 
-On the Cloudflare Workers Free plan, Clearbox intentionally uses small sequential sync pages to stay within the 10 ms CPU allowance. A full scan therefore makes more short `/api/sync` requests than the local build. Short-lived Google access tokens are reused inside warm Worker isolates to avoid an OAuth refresh on every page. Messages moved or deleted between Gmail's list and metadata responses are skipped safely instead of aborting the scan. Cloudflare HTML error pages are never parsed as JSON, and a forcibly interrupted page is retried after its short lock expires.
+On the Cloudflare Workers Free plan, Clearbox intentionally uses small sequential metadata pages to stay within the 10 ms CPU allowance. Gmail ID discovery is separately cached in 500-ID resumable chunks, message metadata is written with one bound JSON upsert per page, and the dashboard refreshes at a timed interval instead of after a fixed number of pages. `SYNC_BATCH_SIZE` defaults to 20 and is clamped to 10-50; increase it only after a production CPU canary. Short-lived Google access tokens are reused inside warm Worker isolates to avoid an OAuth refresh on every page. Messages moved or deleted between Gmail's list and metadata responses are skipped safely instead of aborting the scan. Cloudflare HTML error pages are never parsed as JSON, and a forcibly interrupted page is retried after its short lock expires.
 
 ## Security guardrails
 
 - Only a Google-verified address with an active `beta_members` record can establish a session. The configured `BETA_ADMIN_EMAIL` is bootstrapped as the administrator.
 - Invitation creation, listing, and revocation require an active administrator session plus same-origin request validation.
 - Every Gmail account, indexed message, preview request, cleanup job, and disconnect operation remains scoped to its owning beta workspace.
+- Persisted sync chunks contain Gmail message IDs only, are keyed to one linked account and run ID, and are removed on completion, revocation, or disconnect.
 - An address invited for its own workspace cannot be captured as another member's secondary Gmail account.
 - Each workspace is limited to five linked Gmail accounts and the deployment is capped at 25 invited/active members.
 - Every dashboard, sync, Trash, Undo, and disconnect query verifies linked-account ownership on the server.

@@ -57,6 +57,16 @@ export const messages = sqliteTable(
   ],
 );
 
+export const syncChunks = sqliteTable("sync_chunks", {
+  userId: text("user_id").primaryKey(),
+  runId: text("run_id").notNull(),
+  messageIdsJson: text("message_ids_json").notNull(),
+  cursor: integer("cursor").notNull().default(0),
+  nextPageToken: text("next_page_token"),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
 export const cleanupJobs = sqliteTable(
   "cleanup_jobs",
   {

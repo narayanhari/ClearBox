@@ -68,7 +68,7 @@ const compactNumber = new Intl.NumberFormat("en", { notation: "compact", maximum
 const actionHeaders = { "x-clearbox-action": "1" };
 const SYNC_STATUS_RETRY_LIMIT = 6;
 const SYNC_LOCK_RETRY_LIMIT = 15;
-const PROGRESSIVE_DASHBOARD_PAGE_INTERVAL = 25;
+const PROGRESSIVE_DASHBOARD_REFRESH_MS = 15_000;
 
 function relativeTime(timestamp: number | null): string {
   if (!timestamp) return "Not synced yet";
@@ -280,7 +280,7 @@ export function MailDashboard() {
       for (const account of accounts) {
         let complete = false;
         let accountIndexed = account.syncIndexedCount;
-        let pageCount = 0;
+        let lastDashboardRefreshAt = Date.now();
         let transientRetries = 0;
         let lockRetries = 0;
         while (!complete) {
@@ -329,9 +329,9 @@ export function MailDashboard() {
           lockRetries = 0;
           accountIndexed = payload.indexedTotal ?? accountIndexed;
           complete = Boolean(payload.complete);
-          pageCount += 1;
-          if (pageCount === 1 || pageCount % PROGRESSIVE_DASHBOARD_PAGE_INTERVAL === 0 || complete) {
+          if (complete || Date.now() - lastDashboardRefreshAt >= PROGRESSIVE_DASHBOARD_REFRESH_MS) {
             await loadDashboard();
+            lastDashboardRefreshAt = Date.now();
           }
         }
         completedIndexed += accountIndexed;

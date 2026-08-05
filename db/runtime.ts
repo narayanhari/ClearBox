@@ -6,6 +6,7 @@ export interface AppEnvironment {
   GOOGLE_CLIENT_SECRET?: string;
   APP_ENCRYPTION_KEY?: string;
   BETA_ADMIN_EMAIL?: string;
+  SYNC_BATCH_SIZE?: string;
   // Backwards-compatible fallback for existing personal deployments.
   ALLOWED_GMAIL_ADDRESS?: string;
 }
@@ -67,6 +68,15 @@ async function initializeSchema(database: D1Database): Promise<void> {
       sync_run_id TEXT NOT NULL,
       trashed_at INTEGER,
       PRIMARY KEY (user_id, id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS sync_chunks (
+      user_id TEXT PRIMARY KEY NOT NULL,
+      run_id TEXT NOT NULL,
+      message_ids_json TEXT NOT NULL,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      next_page_token TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS cleanup_jobs (
       id TEXT PRIMARY KEY NOT NULL,
@@ -153,6 +163,9 @@ async function ensureBetaAdmin(database: D1Database): Promise<void> {
     if (!previous.owner_id) continue;
     statements.push(
       database.prepare("DELETE FROM cleanup_jobs WHERE user_id = ?").bind(previous.owner_id),
+      database
+        .prepare("DELETE FROM sync_chunks WHERE user_id IN (SELECT id FROM users WHERE owner_user_id = ?)")
+        .bind(previous.owner_id),
       database
         .prepare("DELETE FROM messages WHERE user_id IN (SELECT id FROM users WHERE owner_user_id = ?)")
         .bind(previous.owner_id),
